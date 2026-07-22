@@ -1,0 +1,45 @@
+# Rust / Cargo build output
+/target/
+/dist/
+
+# DMO user projects, recordings, imports, and renders
+/Recordings/
+/Exports/
+*.dmo
+*.dmo~
+*.wav
+*.wave
+*.mid
+*.midi
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+
+# IDE and editor state
+/.idea/
+/.vscode/
+/.vs/
+*.suo
+*.user
+*.code-workspace
+*~
+*.swp
+*.swo
+
+# Codex / agent-local workspace state
+/.agents/
+/.codex/
+
+# Operating-system metadata
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Logs, crash dumps, and temporary files
+*.log
+*.dmp
+*.tmp
+*.temp
+*.bak

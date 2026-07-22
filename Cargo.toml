@@ -1,0 +1,16 @@
+[workspace]
+members = ["crates/dmo-core", "crates/dmo-audio", "crates/dmo-app", "crates/dmo-gui"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.92"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "warn"
+pedantic = "warn"
