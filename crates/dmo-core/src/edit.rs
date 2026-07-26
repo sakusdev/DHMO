@@ -1,7 +1,8 @@
 use std::{collections::VecDeque, fmt};
 
 use crate::{
-    AudioTake, Bus, ChannelInsert, ChannelOutput, Clip, Instrument, Project, Track, TrackSend,
+    ArrangerSection, AudioTake, Bus, ChannelInsert, ChannelOutput, Clip, CycleRange, Instrument,
+    Marker, Project, TimeSignature, Track, TrackSend,
 };
 
 /// The number of edits retained by [`EditHistory::default`].
@@ -16,8 +17,30 @@ pub const DEFAULT_EDIT_HISTORY_LIMIT: usize = 100;
 pub enum EditCommand {
     /// Sets the project tempo in beats per minute.
     SetTempo { tempo_bpm: f64 },
+    /// Sets the project-wide musical meter.
+    SetTimeSignature { time_signature: TimeSignature },
+    /// Sets or clears the saved cycle/loop range.
+    SetCycleRange { cycle_range: Option<CycleRange> },
     /// Sets the linear master output gain.
     SetMasterGain { gain: f32 },
+    /// Inserts a timeline marker.
+    AddMarker { index: usize, marker: Marker },
+    /// Removes a timeline marker.
+    DeleteMarker { index: usize },
+    /// Replaces a timeline marker while preserving its position in the marker list.
+    ReplaceMarker { index: usize, marker: Marker },
+    /// Inserts an arranger section.
+    AddArrangerSection {
+        index: usize,
+        section: ArrangerSection,
+    },
+    /// Removes an arranger section.
+    DeleteArrangerSection { index: usize },
+    /// Replaces an arranger section while preserving its list position.
+    ReplaceArrangerSection {
+        index: usize,
+        section: ArrangerSection,
+    },
     /// Replaces the ordered master insert chain.
     SetMasterInserts { inserts: Vec<ChannelInsert> },
     /// Inserts a bus while preserving existing bus references.
@@ -124,7 +147,21 @@ impl EditCommand {
     fn execute(self, project: &mut Project) -> Result<Self, EditError> {
         match self {
             Self::SetTempo { tempo_bpm } => set_tempo(project, tempo_bpm),
+            Self::SetTimeSignature { time_signature } => {
+                set_time_signature(project, time_signature)
+            }
+            Self::SetCycleRange { cycle_range } => set_cycle_range(project, cycle_range),
             Self::SetMasterGain { gain } => set_master_gain(project, gain),
+            Self::AddMarker { index, marker } => add_marker(project, index, marker),
+            Self::DeleteMarker { index } => delete_marker(project, index),
+            Self::ReplaceMarker { index, marker } => replace_marker(project, index, marker),
+            Self::AddArrangerSection { index, section } => {
+                add_arranger_section(project, index, section)
+            }
+            Self::DeleteArrangerSection { index } => delete_arranger_section(project, index),
+            Self::ReplaceArrangerSection { index, section } => {
+                replace_arranger_section(project, index, section)
+            }
             Self::SetMasterInserts { inserts } => Ok(set_master_inserts(project, inserts)),
             Self::AddBus { index, bus } => add_bus(project, index, bus),
             Self::DeleteBus { index } => delete_bus(project, index),
@@ -220,6 +257,42 @@ fn set_tempo(project: &mut Project, tempo_bpm: f64) -> Result<EditCommand, EditE
     })
 }
 
+fn set_time_signature(
+    project: &mut Project,
+    time_signature: TimeSignature,
+) -> Result<EditCommand, EditError> {
+    if TimeSignature::new(time_signature.numerator, time_signature.denominator).is_none() {
+        return Err(EditError::InvalidTimeSignature {
+            numerator: time_signature.numerator,
+            denominator: time_signature.denominator,
+        });
+    }
+    let previous = project.time_signature;
+    project.time_signature = time_signature;
+    Ok(EditCommand::SetTimeSignature {
+        time_signature: previous,
+    })
+}
+
+fn set_cycle_range(
+    project: &mut Project,
+    cycle_range: Option<CycleRange>,
+) -> Result<EditCommand, EditError> {
+    if let Some(range) = cycle_range
+        && range.end_frame <= range.start_frame
+    {
+        return Err(EditError::InvalidCycleRange {
+            start_frame: range.start_frame,
+            end_frame: range.end_frame,
+        });
+    }
+    let previous = project.cycle_range;
+    project.cycle_range = cycle_range;
+    Ok(EditCommand::SetCycleRange {
+        cycle_range: previous,
+    })
+}
+
 fn set_master_gain(project: &mut Project, gain: f32) -> Result<EditCommand, EditError> {
     if !gain.is_finite() || gain < 0.0 {
         return Err(EditError::InvalidMasterGain(gain));
@@ -227,6 +300,99 @@ fn set_master_gain(project: &mut Project, gain: f32) -> Result<EditCommand, Edit
     let previous = project.master_gain;
     project.master_gain = gain;
     Ok(EditCommand::SetMasterGain { gain: previous })
+}
+
+fn add_marker(
+    project: &mut Project,
+    index: usize,
+    marker: Marker,
+) -> Result<EditCommand, EditError> {
+    if index > project.markers.len() {
+        return Err(EditError::MarkerIndexOutOfBounds {
+            marker_index: index,
+            marker_count: project.markers.len(),
+        });
+    }
+    project.markers.insert(index, marker);
+    Ok(EditCommand::DeleteMarker { index })
+}
+
+fn delete_marker(project: &mut Project, index: usize) -> Result<EditCommand, EditError> {
+    if index >= project.markers.len() {
+        return Err(EditError::MarkerIndexOutOfBounds {
+            marker_index: index,
+            marker_count: project.markers.len(),
+        });
+    }
+    let marker = project.markers.remove(index);
+    Ok(EditCommand::AddMarker { index, marker })
+}
+
+fn replace_marker(
+    project: &mut Project,
+    index: usize,
+    marker: Marker,
+) -> Result<EditCommand, EditError> {
+    let marker_count = project.markers.len();
+    let slot = project
+        .markers
+        .get_mut(index)
+        .ok_or(EditError::MarkerIndexOutOfBounds {
+            marker_index: index,
+            marker_count,
+        })?;
+    let previous = std::mem::replace(slot, marker);
+    Ok(EditCommand::ReplaceMarker {
+        index,
+        marker: previous,
+    })
+}
+
+fn add_arranger_section(
+    project: &mut Project,
+    index: usize,
+    mut section: ArrangerSection,
+) -> Result<EditCommand, EditError> {
+    if index > project.arranger_sections.len() {
+        return Err(EditError::ArrangerSectionIndexOutOfBounds {
+            section_index: index,
+            section_count: project.arranger_sections.len(),
+        });
+    }
+    section.length_frames = section.length_frames.max(1);
+    project.arranger_sections.insert(index, section);
+    Ok(EditCommand::DeleteArrangerSection { index })
+}
+
+fn delete_arranger_section(project: &mut Project, index: usize) -> Result<EditCommand, EditError> {
+    if index >= project.arranger_sections.len() {
+        return Err(EditError::ArrangerSectionIndexOutOfBounds {
+            section_index: index,
+            section_count: project.arranger_sections.len(),
+        });
+    }
+    let section = project.arranger_sections.remove(index);
+    Ok(EditCommand::AddArrangerSection { index, section })
+}
+
+fn replace_arranger_section(
+    project: &mut Project,
+    index: usize,
+    mut section: ArrangerSection,
+) -> Result<EditCommand, EditError> {
+    section.length_frames = section.length_frames.max(1);
+    let section_count = project.arranger_sections.len();
+    let slot = project.arranger_sections.get_mut(index).ok_or(
+        EditError::ArrangerSectionIndexOutOfBounds {
+            section_index: index,
+            section_count,
+        },
+    )?;
+    let previous = std::mem::replace(slot, section);
+    Ok(EditCommand::ReplaceArrangerSection {
+        index,
+        section: previous,
+    })
 }
 
 fn set_master_inserts(project: &mut Project, inserts: Vec<ChannelInsert>) -> EditCommand {
@@ -730,8 +896,30 @@ fn track_mut(project: &mut Project, track_index: usize) -> Result<&mut Track, Ed
 pub enum EditError {
     /// The tempo is not finite or falls outside the supported project range.
     InvalidTempo(f64),
+    /// Time signatures support numerators 1..=32 and common power-of-two denominators.
+    InvalidTimeSignature {
+        numerator: u8,
+        denominator: u8,
+    },
+    /// A saved cycle range must contain at least one frame.
+    InvalidCycleRange {
+        start_frame: u64,
+        end_frame: u64,
+    },
     /// Master gain must be finite and non-negative.
     InvalidMasterGain(f32),
+    /// A command referred to a marker that does not exist. For insertion, an
+    /// index equal to `marker_count` is valid.
+    MarkerIndexOutOfBounds {
+        marker_index: usize,
+        marker_count: usize,
+    },
+    /// A command referred to an arranger section that does not exist. For
+    /// insertion, an index equal to `section_count` is valid.
+    ArrangerSectionIndexOutOfBounds {
+        section_index: usize,
+        section_count: usize,
+    },
     BusIndexOutOfBounds {
         bus_index: usize,
         bus_count: usize,
@@ -780,9 +968,37 @@ impl fmt::Display for EditError {
                 formatter,
                 "invalid tempo: {tempo_bpm} BPM (expected 20..=400)"
             ),
+            Self::InvalidTimeSignature {
+                numerator,
+                denominator,
+            } => write!(
+                formatter,
+                "invalid time signature: {numerator}/{denominator} (expected 1..=32 over 2/4/8/16/32)"
+            ),
+            Self::InvalidCycleRange {
+                start_frame,
+                end_frame,
+            } => write!(
+                formatter,
+                "invalid cycle range: end frame {end_frame} must be after start frame {start_frame}"
+            ),
             Self::InvalidMasterGain(gain) => {
                 write!(formatter, "invalid master gain: {gain} (expected >= 0)")
             }
+            Self::MarkerIndexOutOfBounds {
+                marker_index,
+                marker_count,
+            } => write!(
+                formatter,
+                "marker index {marker_index} is out of bounds for {marker_count} markers"
+            ),
+            Self::ArrangerSectionIndexOutOfBounds {
+                section_index,
+                section_count,
+            } => write!(
+                formatter,
+                "arranger section index {section_index} is out of bounds for {section_count} sections"
+            ),
             Self::BusIndexOutOfBounds {
                 bus_index,
                 bus_count,
@@ -1000,6 +1216,7 @@ mod tests {
             gain: 1.0,
             fade_in_frames: 0,
             fade_out_frames: 0,
+            fade_curve: crate::FadeCurve::Linear,
             source: ClipSource::Sine {
                 frequency_hz: 440.0,
                 amplitude: 0.5,
@@ -1015,13 +1232,117 @@ mod tests {
             gain: 1.0,
             fade_in_frames: 0,
             fade_out_frames: 0,
+            fade_curve: crate::FadeCurve::Linear,
             source: ClipSource::AudioFile {
                 path: path.into(),
                 source_offset_frames: 0,
                 source_sample_rate: 48_000,
                 channels: 2,
+                reversed: false,
             },
         }
+    }
+
+    #[test]
+    fn marker_edits_are_reversible() {
+        let mut project = Project::new("Markers", 48_000, 120.0).unwrap();
+        let mut history = EditHistory::new(10);
+
+        history
+            .apply(
+                &mut project,
+                EditCommand::AddMarker {
+                    index: 0,
+                    marker: Marker::new("Verse", 48_000),
+                },
+            )
+            .unwrap();
+        assert_eq!(project.markers, vec![Marker::new("Verse", 48_000)]);
+
+        history
+            .apply(
+                &mut project,
+                EditCommand::ReplaceMarker {
+                    index: 0,
+                    marker: Marker::new("Chorus", 96_000),
+                },
+            )
+            .unwrap();
+        assert_eq!(project.markers, vec![Marker::new("Chorus", 96_000)]);
+
+        assert!(history.undo(&mut project).unwrap());
+        assert_eq!(project.markers, vec![Marker::new("Verse", 48_000)]);
+        assert!(history.undo(&mut project).unwrap());
+        assert!(project.markers.is_empty());
+        assert!(history.redo(&mut project).unwrap());
+        assert_eq!(project.markers, vec![Marker::new("Verse", 48_000)]);
+    }
+
+    #[test]
+    fn cycle_range_edits_are_reversible() {
+        let mut project = Project::new("Cycle", 48_000, 120.0).unwrap();
+        let mut history = EditHistory::new(10);
+
+        let range = CycleRange::new(48_000, 96_000).unwrap();
+        history
+            .apply(
+                &mut project,
+                EditCommand::SetCycleRange {
+                    cycle_range: Some(range),
+                },
+            )
+            .unwrap();
+        assert_eq!(project.cycle_range, Some(range));
+
+        history
+            .apply(
+                &mut project,
+                EditCommand::SetCycleRange { cycle_range: None },
+            )
+            .unwrap();
+        assert_eq!(project.cycle_range, None);
+
+        assert!(history.undo(&mut project).unwrap());
+        assert_eq!(project.cycle_range, Some(range));
+        assert!(history.undo(&mut project).unwrap());
+        assert_eq!(project.cycle_range, None);
+        assert!(history.redo(&mut project).unwrap());
+        assert_eq!(project.cycle_range, Some(range));
+    }
+
+    #[test]
+    fn arranger_section_edits_are_reversible() {
+        let mut project = Project::new("Arrangement", 48_000, 120.0).unwrap();
+        let mut history = EditHistory::new(10);
+
+        history
+            .apply(
+                &mut project,
+                EditCommand::AddArrangerSection {
+                    index: 0,
+                    section: ArrangerSection::new("Verse", 0, 96_000),
+                },
+            )
+            .unwrap();
+        assert_eq!(project.arranger_sections[0].name, "Verse");
+
+        history
+            .apply(
+                &mut project,
+                EditCommand::ReplaceArrangerSection {
+                    index: 0,
+                    section: ArrangerSection::new("Chorus", 96_000, 96_000),
+                },
+            )
+            .unwrap();
+        assert_eq!(project.arranger_sections[0].name, "Chorus");
+
+        assert!(history.undo(&mut project).unwrap());
+        assert_eq!(project.arranger_sections[0].name, "Verse");
+        assert!(history.undo(&mut project).unwrap());
+        assert!(project.arranger_sections.is_empty());
+        assert!(history.redo(&mut project).unwrap());
+        assert_eq!(project.arranger_sections[0].name, "Verse");
     }
 
     #[test]
@@ -1396,11 +1717,13 @@ mod tests {
             gain: 1.0,
             fade_in_frames: 0,
             fade_out_frames: 0,
+            fade_curve: crate::FadeCurve::Linear,
             source: ClipSource::AudioFile {
                 path: "take.wav".into(),
                 source_offset_frames: 200,
                 source_sample_rate: 44_100,
                 channels: 2,
+                reversed: false,
             },
         });
         project.tracks.push(track);

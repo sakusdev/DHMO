@@ -336,6 +336,7 @@ pub fn import_wav_with_overview(
             source_offset_frames: 0,
             source_sample_rate: info.sample_rate,
             channels: info.channels,
+            reversed: false,
         },
         info,
         overview,

@@ -5,13 +5,15 @@ use std::{
 };
 
 use crate::{
-    AudioTake, AutomationPoint, Bus, ChannelInsert, ChannelOutput, Clip, ClipSource, InsertEffect,
-    Instrument, MidiChannelPressurePoint, MidiControlPoint, MidiNote, MidiPitchBendPoint,
-    MidiPolyPressurePoint, Project, ProjectError, Track, TrackInput, TrackRecording, TrackSend,
+    ArrangerSection, AudioTake, AutomationPoint, Bus, ChannelInsert, ChannelOutput, Clip,
+    ClipSource, CycleRange, FadeCurve, InsertEffect, Instrument, Marker, MidiChannelPressurePoint,
+    MidiControlPoint, MidiNote, MidiPitchBendPoint, MidiPolyPressurePoint, MidiProgramChangePoint,
+    Project, ProjectError, SoundFontPreset, TimeSignature, Track, TrackInput, TrackRecording,
+    TrackSend,
 };
 
 /// The project-file format version written by this release.
-pub const PROJECT_FILE_VERSION: u32 = 12;
+pub const PROJECT_FILE_VERSION: u32 = 20;
 
 const LEGACY_PROJECT_FILE_VERSION: u32 = 1;
 const AUDIO_PROJECT_FILE_VERSION: u32 = 2;
@@ -24,6 +26,15 @@ const AUTOMATION_PROJECT_FILE_VERSION: u32 = 8;
 const RECORDING_PROJECT_FILE_VERSION: u32 = 9;
 const TAKE_LANE_PROJECT_FILE_VERSION: u32 = 10;
 const MIXER_PROJECT_FILE_VERSION: u32 = 11;
+const LIVE_MIDI_PROJECT_FILE_VERSION: u32 = 12;
+const MARKER_PROJECT_FILE_VERSION: u32 = 13;
+const ARRANGER_PROJECT_FILE_VERSION: u32 = 14;
+const CYCLE_PROJECT_FILE_VERSION: u32 = 15;
+const FADE_CURVE_PROJECT_FILE_VERSION: u32 = 16;
+const PROGRAM_CHANGE_PROJECT_FILE_VERSION: u32 = 17;
+const AUDIO_REVERSE_PROJECT_FILE_VERSION: u32 = 18;
+const TIME_SIGNATURE_PROJECT_FILE_VERSION: u32 = 19;
+const SOUNDFONT_PROJECT_FILE_VERSION: u32 = 20;
 
 const FILE_HEADER: &str = "DMO_PROJECT";
 
@@ -98,6 +109,44 @@ pub fn encode_project(project: &Project) -> Result<String, ProjectFileError> {
     push_string(&mut output, "name", &project.name);
     push_value(&mut output, "sample_rate", &project.sample_rate);
     push_value(&mut output, "tempo_bpm", &project.tempo_bpm);
+    push_value(
+        &mut output,
+        "time_signature_numerator",
+        &project.time_signature.numerator,
+    );
+    push_value(
+        &mut output,
+        "time_signature_denominator",
+        &project.time_signature.denominator,
+    );
+    match project.cycle_range {
+        Some(range) => {
+            push_value(&mut output, "cycle_enabled", &true);
+            push_value(&mut output, "cycle_start_frame", &range.start_frame);
+            push_value(&mut output, "cycle_end_frame", &range.end_frame);
+        }
+        None => push_value(&mut output, "cycle_enabled", &false),
+    }
+    push_value(&mut output, "markers", &project.markers.len());
+    for marker in &project.markers {
+        output.push_str("marker\n");
+        push_string(&mut output, "name", &marker.name);
+        push_value(&mut output, "frame", &marker.frame);
+        output.push_str("end_marker\n");
+    }
+    push_value(
+        &mut output,
+        "arranger_sections",
+        &project.arranger_sections.len(),
+    );
+    for section in &project.arranger_sections {
+        output.push_str("arranger_section\n");
+        push_string(&mut output, "name", &section.name);
+        push_value(&mut output, "start_frame", &section.start_frame);
+        push_value(&mut output, "length_frames", &section.length_frames);
+        push_value(&mut output, "color_index", &section.color_index);
+        output.push_str("end_arranger_section\n");
+    }
     push_value(&mut output, "master_gain", &project.master_gain);
     encode_insert_chain(&mut output, "master_inserts", &project.master_inserts);
     push_value(&mut output, "buses", &project.buses.len());
@@ -157,6 +206,13 @@ pub fn encode_project(project: &Project) -> Result<String, ProjectFileError> {
             &track.instrument.label().to_ascii_lowercase(),
         );
         push_value(&mut output, "midi_channel", &track.midi_channel);
+        push_value(&mut output, "soundfont_enabled", &track.soundfont.is_some());
+        if let Some(soundfont) = &track.soundfont {
+            push_string(&mut output, "soundfont_path", &soundfont.path);
+            push_value(&mut output, "soundfont_bank", &soundfont.bank);
+            push_value(&mut output, "soundfont_program", &soundfont.program);
+            push_string(&mut output, "soundfont_name", &soundfont.name);
+        }
         push_value(&mut output, "midi_cc_points", &track.midi_cc.len());
         for point in &track.midi_cc {
             output.push_str("midi_cc\n");
@@ -201,6 +257,17 @@ pub fn encode_project(project: &Project) -> Result<String, ProjectFileError> {
         }
         push_value(
             &mut output,
+            "midi_program_changes",
+            &track.midi_program_changes.len(),
+        );
+        for point in &track.midi_program_changes {
+            output.push_str("midi_program_change\n");
+            push_value(&mut output, "frame", &point.frame);
+            push_value(&mut output, "program", &point.program);
+            output.push_str("end_midi_program_change\n");
+        }
+        push_value(
+            &mut output,
             "volume_automation_points",
             &track.volume_automation.len(),
         );
@@ -220,6 +287,7 @@ pub fn encode_project(project: &Project) -> Result<String, ProjectFileError> {
             push_value(&mut output, "clip_gain", &clip.gain);
             push_value(&mut output, "fade_in_frames", &clip.fade_in_frames);
             push_value(&mut output, "fade_out_frames", &clip.fade_out_frames);
+            push_value(&mut output, "fade_curve", &clip.fade_curve.as_str());
             match &clip.source {
                 ClipSource::Midi { notes, amplitude } => {
                     output.push_str("source midi\n");
@@ -247,12 +315,14 @@ pub fn encode_project(project: &Project) -> Result<String, ProjectFileError> {
                     source_offset_frames,
                     source_sample_rate,
                     channels,
+                    reversed,
                 } => {
                     output.push_str("source audio_file\n");
                     push_string(&mut output, "path", path);
                     push_value(&mut output, "source_offset_frames", source_offset_frames);
                     push_value(&mut output, "source_sample_rate", source_sample_rate);
                     push_value(&mut output, "channels", channels);
+                    push_value(&mut output, "reversed", reversed);
                 }
             }
             output.push_str("end_clip\n");
@@ -276,10 +346,12 @@ fn encode_take(output: &mut String, take: &AudioTake) {
     push_value(output, "clip_gain", &take.gain);
     push_value(output, "fade_in_frames", &take.fade_in_frames);
     push_value(output, "fade_out_frames", &take.fade_out_frames);
+    push_value(output, "fade_curve", &take.fade_curve.as_str());
     push_string(output, "path", &take.path);
     push_value(output, "source_offset_frames", &take.source_offset_frames);
     push_value(output, "source_sample_rate", &take.source_sample_rate);
     push_value(output, "channels", &take.channels);
+    push_value(output, "reversed", &take.reversed);
     output.push_str("end_take_lane\n");
 }
 
@@ -355,6 +427,14 @@ pub fn decode_project(input: &str) -> Result<Project, ProjectFileError> {
             | RECORDING_PROJECT_FILE_VERSION
             | TAKE_LANE_PROJECT_FILE_VERSION
             | MIXER_PROJECT_FILE_VERSION
+            | LIVE_MIDI_PROJECT_FILE_VERSION
+            | MARKER_PROJECT_FILE_VERSION
+            | ARRANGER_PROJECT_FILE_VERSION
+            | CYCLE_PROJECT_FILE_VERSION
+            | FADE_CURVE_PROJECT_FILE_VERSION
+            | PROGRAM_CHANGE_PROJECT_FILE_VERSION
+            | AUDIO_REVERSE_PROJECT_FILE_VERSION
+            | TIME_SIGNATURE_PROJECT_FILE_VERSION
             | PROJECT_FILE_VERSION
     ) {
         return Err(ProjectFileError::UnsupportedVersion(version));
@@ -363,6 +443,76 @@ pub fn decode_project(input: &str) -> Result<Project, ProjectFileError> {
     let (_, name) = parser.string_field("name")?;
     let (_, sample_rate) = parser.value_field::<u32>("sample_rate")?;
     let (_, tempo_bpm) = parser.value_field::<f64>("tempo_bpm")?;
+    let time_signature = if version >= TIME_SIGNATURE_PROJECT_FILE_VERSION {
+        let (numerator_line, numerator) = parser.value_field::<u8>("time_signature_numerator")?;
+        let (_, denominator) = parser.value_field::<u8>("time_signature_denominator")?;
+        TimeSignature::new(numerator, denominator).ok_or_else(|| {
+            invalid_data(
+                numerator_line,
+                format!("invalid time signature `{numerator}/{denominator}`"),
+            )
+        })?
+    } else {
+        TimeSignature::default()
+    };
+    let cycle_range = if version >= CYCLE_PROJECT_FILE_VERSION {
+        let (_, cycle_enabled) = parser.value_field::<bool>("cycle_enabled")?;
+        if cycle_enabled {
+            let (_, start_frame) = parser.value_field::<u64>("cycle_start_frame")?;
+            let (end_line, end_frame) = parser.value_field::<u64>("cycle_end_frame")?;
+            Some(CycleRange::new(start_frame, end_frame).ok_or_else(|| {
+                invalid_data(
+                    end_line,
+                    "`cycle_end_frame` must be greater than `cycle_start_frame`".into(),
+                )
+            })?)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let markers = if version >= MARKER_PROJECT_FILE_VERSION {
+        let (_, marker_count) = parser.value_field::<usize>("markers")?;
+        let mut markers = Vec::with_capacity(marker_count);
+        for _ in 0..marker_count {
+            parser.literal("marker")?;
+            let (_, name) = parser.string_field("name")?;
+            let (_, frame) = parser.value_field::<u64>("frame")?;
+            parser.literal("end_marker")?;
+            markers.push(Marker { name, frame });
+        }
+        markers
+    } else {
+        Vec::new()
+    };
+    let arranger_sections = if version >= ARRANGER_PROJECT_FILE_VERSION {
+        let (_, section_count) = parser.value_field::<usize>("arranger_sections")?;
+        let mut sections = Vec::with_capacity(section_count);
+        for _ in 0..section_count {
+            parser.literal("arranger_section")?;
+            let (_, name) = parser.string_field("name")?;
+            let (_, start_frame) = parser.value_field::<u64>("start_frame")?;
+            let (length_line, length_frames) = parser.value_field::<u64>("length_frames")?;
+            if length_frames == 0 {
+                return Err(invalid_data(
+                    length_line,
+                    "`length_frames` must be greater than zero".into(),
+                ));
+            }
+            let (_, color_index) = parser.value_field::<u8>("color_index")?;
+            parser.literal("end_arranger_section")?;
+            sections.push(ArrangerSection {
+                name,
+                start_frame,
+                length_frames,
+                color_index,
+            });
+        }
+        sections
+    } else {
+        Vec::new()
+    };
     let master_gain = if version >= AUTOMATION_PROJECT_FILE_VERSION {
         let (line, gain) = parser.value_field::<f32>("master_gain")?;
         require_finite(gain, line, "master_gain")?;
@@ -378,6 +528,10 @@ pub fn decode_project(input: &str) -> Result<Project, ProjectFileError> {
     };
     let mut project =
         Project::new(name, sample_rate, tempo_bpm).map_err(ProjectFileError::InvalidProject)?;
+    project.cycle_range = cycle_range;
+    project.time_signature = time_signature;
+    project.markers = markers;
+    project.arranger_sections = arranger_sections;
     project.master_gain = master_gain;
     if version >= MIXER_PROJECT_FILE_VERSION {
         project.master_inserts = decode_insert_chain(&mut parser, "master_inserts")?;
@@ -427,7 +581,7 @@ pub fn decode_project(input: &str) -> Result<Project, ProjectFileError> {
         } else {
             (false, false)
         };
-        let input = if version >= PROJECT_FILE_VERSION {
+        let input = if version >= LIVE_MIDI_PROJECT_FILE_VERSION {
             let (line, input_name) = parser.field("record_input")?;
             match input_name {
                 "audio" => TrackInput::Audio,
@@ -512,6 +666,26 @@ pub fn decode_project(input: &str) -> Result<Project, ProjectFileError> {
         } else {
             (Instrument::Sine, 1)
         };
+        let soundfont = if version >= SOUNDFONT_PROJECT_FILE_VERSION {
+            let (_, enabled) = parser.value_field::<bool>("soundfont_enabled")?;
+            if enabled {
+                let (_, path) = parser.string_field("soundfont_path")?;
+                let (_, bank) = parser.value_field::<u16>("soundfont_bank")?;
+                let (program_line, program) = parser.value_field::<u16>("soundfont_program")?;
+                if program > 127 {
+                    return Err(invalid_data(
+                        program_line,
+                        "SoundFont program must be between 0 and 127".into(),
+                    ));
+                }
+                let (_, name) = parser.string_field("soundfont_name")?;
+                Some(SoundFontPreset::new(path, bank, program, name))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let midi_cc = if version >= MIXER_PROJECT_FILE_VERSION {
             let (_, point_count) = parser.value_field::<usize>("midi_cc_points")?;
             let mut points = Vec::with_capacity(point_count);
@@ -539,7 +713,7 @@ pub fn decode_project(input: &str) -> Result<Project, ProjectFileError> {
             Vec::new()
         };
         let (midi_pitch_bend, midi_channel_pressure, midi_poly_pressure) = if version
-            >= PROJECT_FILE_VERSION
+            >= LIVE_MIDI_PROJECT_FILE_VERSION
         {
             let (_, pitch_count) = parser.value_field::<usize>("midi_pitch_bend_points")?;
             let mut pitch = Vec::with_capacity(pitch_count);
@@ -596,6 +770,27 @@ pub fn decode_project(input: &str) -> Result<Project, ProjectFileError> {
         } else {
             (Vec::new(), Vec::new(), Vec::new())
         };
+        let midi_program_changes = if version >= PROGRAM_CHANGE_PROJECT_FILE_VERSION {
+            let (_, point_count) = parser.value_field::<usize>("midi_program_changes")?;
+            let mut points = Vec::with_capacity(point_count);
+            for _ in 0..point_count {
+                parser.literal("midi_program_change")?;
+                let (_, frame) = parser.value_field::<u64>("frame")?;
+                let (program_line, program) = parser.value_field::<u8>("program")?;
+                if !(1..=128).contains(&program) {
+                    return Err(invalid_data(
+                        program_line,
+                        "MIDI program number must be between 1 and 128".into(),
+                    ));
+                }
+                parser.literal("end_midi_program_change")?;
+                points.push(MidiProgramChangePoint { frame, program });
+            }
+            points.sort_by_key(|point| point.frame);
+            points
+        } else {
+            Vec::new()
+        };
         let volume_automation = if version >= AUTOMATION_PROJECT_FILE_VERSION {
             let (_, point_count) = parser.value_field::<usize>("volume_automation_points")?;
             let mut points = Vec::with_capacity(point_count);
@@ -635,11 +830,13 @@ pub fn decode_project(input: &str) -> Result<Project, ProjectFileError> {
             sends,
             inserts,
             instrument,
+            soundfont,
             midi_channel,
             midi_cc,
             midi_pitch_bend,
             midi_channel_pressure,
             midi_poly_pressure,
+            midi_program_changes,
             volume_automation,
             take_lanes: Vec::new(),
             clips: Vec::new(),
@@ -650,7 +847,7 @@ pub fn decode_project(input: &str) -> Result<Project, ProjectFileError> {
             let (_, clip_name) = parser.string_field("name")?;
             let (_, start_frame) = parser.value_field::<u64>("start_frame")?;
             let (_, length_frames) = parser.value_field::<u64>("length_frames")?;
-            let (gain, fade_in_frames, fade_out_frames) =
+            let (gain, fade_in_frames, fade_out_frames, fade_curve) =
                 if version >= CLIP_MIX_PROJECT_FILE_VERSION {
                     let (gain_line, gain) = parser.value_field::<f32>("clip_gain")?;
                     require_finite(gain, gain_line, "clip_gain")?;
@@ -660,13 +857,17 @@ pub fn decode_project(input: &str) -> Result<Project, ProjectFileError> {
                             "`clip_gain` must be non-negative".into(),
                         ));
                     }
-                    (
-                        gain,
-                        parser.value_field::<u64>("fade_in_frames")?.1,
-                        parser.value_field::<u64>("fade_out_frames")?.1,
-                    )
+                    let fade_in_frames = parser.value_field::<u64>("fade_in_frames")?.1;
+                    let fade_out_frames = parser.value_field::<u64>("fade_out_frames")?.1;
+                    let fade_curve = if version >= FADE_CURVE_PROJECT_FILE_VERSION {
+                        let (curve_line, curve_name) = parser.field("fade_curve")?;
+                        parse_fade_curve(curve_line, curve_name)?
+                    } else {
+                        FadeCurve::Linear
+                    };
+                    (gain, fade_in_frames, fade_out_frames, fade_curve)
                 } else {
-                    (1.0, 0, 0)
+                    (1.0, 0, 0, FadeCurve::Linear)
                 };
             let (source_line, source_name) = parser.field("source")?;
             let source = match (version, source_name) {
@@ -720,11 +921,18 @@ pub fn decode_project(input: &str) -> Result<Project, ProjectFileError> {
                     let (_, source_sample_rate) =
                         parser.value_field::<u32>("source_sample_rate")?;
                     let (_, channels) = parser.value_field::<u16>("channels")?;
+                    let reversed = if version >= AUDIO_REVERSE_PROJECT_FILE_VERSION {
+                        let (_, reversed) = parser.value_field::<bool>("reversed")?;
+                        reversed
+                    } else {
+                        false
+                    };
                     ClipSource::AudioFile {
                         path,
                         source_offset_frames,
                         source_sample_rate,
                         channels,
+                        reversed,
                     }
                 }
                 (_, other) => {
@@ -743,6 +951,7 @@ pub fn decode_project(input: &str) -> Result<Project, ProjectFileError> {
                 gain,
                 fade_in_frames,
                 fade_out_frames,
+                fade_curve,
                 source,
             });
         }
@@ -764,11 +973,23 @@ pub fn decode_project(input: &str) -> Result<Project, ProjectFileError> {
                 }
                 let (_, fade_in_frames) = parser.value_field::<u64>("fade_in_frames")?;
                 let (_, fade_out_frames) = parser.value_field::<u64>("fade_out_frames")?;
+                let fade_curve = if version >= FADE_CURVE_PROJECT_FILE_VERSION {
+                    let (curve_line, curve_name) = parser.field("fade_curve")?;
+                    parse_fade_curve(curve_line, curve_name)?
+                } else {
+                    FadeCurve::Linear
+                };
                 let (_, path) = parser.string_field("path")?;
                 let (_, source_offset_frames) =
                     parser.value_field::<u64>("source_offset_frames")?;
                 let (_, source_sample_rate) = parser.value_field::<u32>("source_sample_rate")?;
                 let (_, channels) = parser.value_field::<u16>("channels")?;
+                let reversed = if version >= AUDIO_REVERSE_PROJECT_FILE_VERSION {
+                    let (_, reversed) = parser.value_field::<bool>("reversed")?;
+                    reversed
+                } else {
+                    false
+                };
                 parser.literal("end_take_lane")?;
                 track.take_lanes.push(AudioTake {
                     name,
@@ -777,10 +998,12 @@ pub fn decode_project(input: &str) -> Result<Project, ProjectFileError> {
                     gain,
                     fade_in_frames,
                     fade_out_frames,
+                    fade_curve,
                     path,
                     source_offset_frames,
                     source_sample_rate,
                     channels,
+                    reversed,
                 });
             }
         }
@@ -868,10 +1091,41 @@ fn finite_field(parser: &mut Parser<'_>, field: &'static str) -> Result<f32, Pro
     Ok(value)
 }
 
+fn parse_fade_curve(line: usize, value: &str) -> Result<FadeCurve, ProjectFileError> {
+    match value {
+        "linear" => Ok(FadeCurve::Linear),
+        "equal_power" => Ok(FadeCurve::EqualPower),
+        "slow" => Ok(FadeCurve::Slow),
+        "fast" => Ok(FadeCurve::Fast),
+        other => Err(invalid_data(line, format!("unknown fade curve `{other}`"))),
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn validate_project(project: &Project) -> Result<(), ProjectFileError> {
     Project::new(&project.name, project.sample_rate, project.tempo_bpm)
         .map_err(ProjectFileError::InvalidProject)?;
+    if TimeSignature::new(
+        project.time_signature.numerator,
+        project.time_signature.denominator,
+    )
+    .is_none()
+    {
+        return Err(ProjectFileError::InvalidProject(
+            ProjectError::InvalidTimeSignature {
+                numerator: project.time_signature.numerator,
+                denominator: project.time_signature.denominator,
+            },
+        ));
+    }
+    if let Some(range) = project.cycle_range
+        && range.end_frame <= range.start_frame
+    {
+        return Err(ProjectFileError::InvalidField {
+            field: "cycle_range",
+            message: "end frame must be greater than start frame".into(),
+        });
+    }
     validate_non_negative_finite(project.master_gain, "master_gain")?;
     for insert in &project.master_inserts {
         validate_insert(insert)?;
@@ -892,6 +1146,20 @@ fn validate_project(project: &Project) -> Result<(), ProjectFileError> {
                 field: "midi_channel",
                 message: "value must be between 1 and 16".into(),
             });
+        }
+        if let Some(soundfont) = &track.soundfont {
+            if soundfont.path.trim().is_empty() || soundfont.name.trim().is_empty() {
+                return Err(ProjectFileError::InvalidField {
+                    field: "soundfont",
+                    message: "path and preset name must not be empty".into(),
+                });
+            }
+            if soundfont.program > 127 {
+                return Err(ProjectFileError::InvalidField {
+                    field: "soundfont_program",
+                    message: "value must be between 0 and 127".into(),
+                });
+            }
         }
         if let TrackInput::MidiChannel(channel) = track.input
             && !(1..=16).contains(&channel)
@@ -966,6 +1234,16 @@ fn validate_project(project: &Project) -> Result<(), ProjectFileError> {
             return Err(ProjectFileError::InvalidField {
                 field: "midi_poly_pressure",
                 message: "note and value must be between 0 and 127".into(),
+            });
+        }
+        if track
+            .midi_program_changes
+            .iter()
+            .any(|point| !(1..=128).contains(&point.program))
+        {
+            return Err(ProjectFileError::InvalidField {
+                field: "midi_program_changes",
+                message: "program must be between 1 and 128".into(),
             });
         }
         for point in &track.volume_automation {
@@ -1367,6 +1645,23 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     fn complete_project() -> Project {
         let mut project = Project::new("Song \"A\"\n\u{7}日本語", 96_000, 137.25).unwrap();
+        project.time_signature = TimeSignature::new(7, 8).unwrap();
+        project.cycle_range = CycleRange::new(12_000, 288_000);
+        project.markers = vec![Marker::new("Intro", 0), Marker::new("Drop \"A\"", 96_000)];
+        project.arranger_sections = vec![
+            ArrangerSection {
+                name: "Intro".into(),
+                start_frame: 0,
+                length_frames: 96_000,
+                color_index: 1,
+            },
+            ArrangerSection {
+                name: "Drop".into(),
+                start_frame: 96_000,
+                length_frames: 192_000,
+                color_index: 3,
+            },
+        ];
         project.master_gain = 0.85;
         project
             .master_inserts
@@ -1404,6 +1699,7 @@ mod tests {
             gain: 0.75,
             fade_in_frames: 32,
             fade_out_frames: 64,
+            fade_curve: FadeCurve::EqualPower,
             source: ClipSource::Sine {
                 frequency_hz: 440.5,
                 amplitude: 0.625,
@@ -1419,6 +1715,12 @@ mod tests {
         bass.recording.input_monitoring = true;
         bass.input = TrackInput::MidiChannel(10);
         bass.instrument = Instrument::Saw;
+        bass.soundfont = Some(SoundFontPreset::new(
+            r"C:\SoundFonts\Studio.sf2",
+            128,
+            5,
+            "Finger Bass",
+        ));
         bass.midi_channel = 10;
         bass.midi_cc = vec![
             MidiControlPoint {
@@ -1445,6 +1747,10 @@ mod tests {
             note: 48,
             value: 72,
         }];
+        bass.midi_program_changes = vec![MidiProgramChangePoint {
+            frame: 120,
+            program: 33,
+        }];
         bass.output = ChannelOutput::Bus(0);
         bass.volume_automation = vec![
             AutomationPoint {
@@ -1463,10 +1769,12 @@ mod tests {
             gain: 0.9,
             fade_in_frames: 12,
             fade_out_frames: 24,
+            fade_curve: FadeCurve::Fast,
             path: r"C:\Recordings\bass_take_1.wav".into(),
             source_offset_frames: 64,
             source_sample_rate: 48_000,
             channels: 2,
+            reversed: true,
         });
         bass.clips.push(Clip {
             name: "MIDI Part".into(),
@@ -1475,6 +1783,7 @@ mod tests {
             gain: 1.25,
             fade_in_frames: 48,
             fade_out_frames: 96,
+            fade_curve: FadeCurve::Slow,
             source: ClipSource::Midi {
                 notes: vec![
                     MidiNote {
@@ -1502,7 +1811,16 @@ mod tests {
         let project = complete_project();
         let encoded = encode_project(&project).unwrap();
 
-        assert!(encoded.starts_with("DMO_PROJECT 12\n"));
+        assert!(encoded.starts_with("DMO_PROJECT 20\n"));
+        assert!(encoded.contains("time_signature_numerator 7\n"));
+        assert!(encoded.contains("time_signature_denominator 8\n"));
+        assert!(encoded.contains("cycle_enabled true\n"));
+        assert!(encoded.contains("cycle_start_frame 12000\n"));
+        assert!(encoded.contains("cycle_end_frame 288000\n"));
+        assert!(encoded.contains("markers 2\n"));
+        assert!(encoded.contains("name \"Drop \\\"A\\\"\"\n"));
+        assert!(encoded.contains("arranger_sections 2\n"));
+        assert!(encoded.contains("color_index 3\n"));
         assert!(encoded.contains("master_gain 0.85\n"));
         assert!(encoded.contains("soloed true\n"));
         assert!(encoded.contains("record_armed true\n"));
@@ -1510,12 +1828,16 @@ mod tests {
         assert!(encoded.contains("record_input midi_channel\n"));
         assert!(encoded.contains("record_input_channel 10\n"));
         assert!(encoded.contains("instrument saw\n"));
+        assert!(encoded.contains("soundfont_enabled true\n"));
+        assert!(encoded.contains(r#"soundfont_path "C:\\SoundFonts\\Studio.sf2""#));
         assert!(encoded.contains("midi_channel 10\n"));
         assert!(encoded.contains("midi_cc_points 2\n"));
         assert!(encoded.contains("controller 11\n"));
         assert!(encoded.contains("midi_pitch_bend_points 1\n"));
         assert!(encoded.contains("midi_channel_pressure_points 1\n"));
         assert!(encoded.contains("midi_poly_pressure_points 1\n"));
+        assert!(encoded.contains("midi_program_changes 1\n"));
+        assert!(encoded.contains("program 33\n"));
         assert!(encoded.contains("source midi\n"));
         assert!(encoded.contains("notes 2\n"));
         assert!(encoded.contains("velocity 96\n"));
@@ -1523,6 +1845,9 @@ mod tests {
         assert!(encoded.contains("clip_gain 0.75\n"));
         assert!(encoded.contains("fade_in_frames 32\n"));
         assert!(encoded.contains("fade_out_frames 64\n"));
+        assert!(encoded.contains("fade_curve equal_power\n"));
+        assert!(encoded.contains("fade_curve fast\n"));
+        assert!(encoded.contains("fade_curve slow\n"));
         assert!(encoded.contains("volume_automation_points 2\n"));
         assert!(encoded.contains("frame 960\n"));
         assert!(encoded.contains("value 1.2\n"));
@@ -1533,6 +1858,7 @@ mod tests {
         assert!(encoded.contains("effect three_band_eq\n"));
         assert!(encoded.contains("pre_fader true\n"));
         assert!(encoded.contains("output_bus_index 0\n"));
+        assert!(encoded.contains("reversed true\n"));
         assert_eq!(decode_project(&encoded).unwrap(), project);
     }
 
@@ -1548,11 +1874,13 @@ mod tests {
             gain: 1.0,
             fade_in_frames: 0,
             fade_out_frames: 0,
+            fade_curve: FadeCurve::Linear,
             source: ClipSource::AudioFile {
                 path: path.into(),
                 source_offset_frames: 1_024,
                 source_sample_rate: 44_100,
                 channels: 2,
+                reversed: false,
             },
         });
         project.tracks.push(track);
@@ -1564,6 +1892,7 @@ mod tests {
         assert!(encoded.contains("source_offset_frames 1024\n"));
         assert!(encoded.contains("source_sample_rate 44100\n"));
         assert!(encoded.contains("channels 2\n"));
+        assert!(encoded.contains("reversed false\n"));
         assert_eq!(decode_project(&encoded).unwrap(), project);
     }
 
@@ -1607,20 +1936,128 @@ mod tests {
         assert!(
             encode_project(&project)
                 .unwrap()
-                .starts_with("DMO_PROJECT 12\n")
+                .starts_with("DMO_PROJECT 20\n")
         );
+    }
+
+    fn without_time_signature_fields(encoded: &str, target_version: u32) -> String {
+        encoded
+            .replacen(
+                "DMO_PROJECT 20",
+                &format!("DMO_PROJECT {target_version}"),
+                1,
+            )
+            .lines()
+            .filter(|line| {
+                !line.starts_with("time_signature_numerator ")
+                    && !line.starts_with("time_signature_denominator ")
+                    && !line.starts_with("soundfont_enabled ")
+                    && !line.starts_with("soundfont_path ")
+                    && !line.starts_with("soundfont_bank ")
+                    && !line.starts_with("soundfont_program ")
+                    && !line.starts_with("soundfont_name ")
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n"
+    }
+
+    fn without_reverse_fields(encoded: &str, target_version: u32) -> String {
+        without_time_signature_fields(encoded, target_version)
+            .lines()
+            .filter(|line| !line.starts_with("reversed "))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n"
+    }
+
+    fn without_program_change_fields(encoded: &str, target_version: u32) -> String {
+        let mut inside_program = false;
+        without_reverse_fields(encoded, target_version)
+            .lines()
+            .filter(|line| {
+                if *line == "midi_program_change" {
+                    inside_program = true;
+                    return false;
+                }
+                if *line == "end_midi_program_change" {
+                    inside_program = false;
+                    return false;
+                }
+                !inside_program && !line.starts_with("midi_program_changes ")
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n"
+    }
+
+    fn without_fade_curve_fields(encoded: &str, target_version: u32) -> String {
+        without_program_change_fields(encoded, target_version)
+            .lines()
+            .filter(|line| !line.starts_with("fade_curve "))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n"
+    }
+
+    fn without_cycle_fields(encoded: &str, target_version: u32) -> String {
+        without_fade_curve_fields(encoded, target_version)
+            .lines()
+            .filter(|line| {
+                !line.starts_with("cycle_enabled ")
+                    && !line.starts_with("cycle_start_frame ")
+                    && !line.starts_with("cycle_end_frame ")
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n"
+    }
+
+    fn without_arranger_fields(encoded: &str, target_version: u32) -> String {
+        let mut inside_section = false;
+        without_cycle_fields(encoded, target_version)
+            .lines()
+            .filter(|line| {
+                if *line == "arranger_section" {
+                    inside_section = true;
+                    return false;
+                }
+                if *line == "end_arranger_section" {
+                    inside_section = false;
+                    return false;
+                }
+                !inside_section && !line.starts_with("arranger_sections ")
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n"
+    }
+
+    fn without_marker_fields(encoded: &str, target_version: u32) -> String {
+        let mut inside_marker = false;
+        without_arranger_fields(encoded, target_version)
+            .lines()
+            .filter(|line| {
+                if *line == "marker" {
+                    inside_marker = true;
+                    return false;
+                }
+                if *line == "end_marker" {
+                    inside_marker = false;
+                    return false;
+                }
+                !inside_marker && !line.starts_with("markers ")
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n"
     }
 
     fn without_record_input_fields(encoded: &str, target_version: u32) -> String {
         let mut inside_pitch = false;
         let mut inside_channel_pressure = false;
         let mut inside_poly_pressure = false;
-        encoded
-            .replacen(
-                "DMO_PROJECT 12",
-                &format!("DMO_PROJECT {target_version}"),
-                1,
-            )
+        without_marker_fields(encoded, target_version)
             .lines()
             .filter(|line| {
                 if *line == "midi_pitch_bend" {
@@ -1724,6 +2161,104 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n")
             + "\n"
+    }
+
+    #[test]
+    fn version_thirteen_keeps_markers_and_defaults_arranger_empty() {
+        let encoded = encode_project(&complete_project()).unwrap();
+        let version_thirteen = without_arranger_fields(&encoded, 13);
+
+        let decoded = decode_project(&version_thirteen).unwrap();
+
+        assert_eq!(decoded.cycle_range, None);
+        assert_eq!(decoded.markers.len(), 2);
+        assert!(decoded.arranger_sections.is_empty());
+    }
+
+    #[test]
+    fn version_fourteen_keeps_arranger_and_defaults_cycle_empty() {
+        let encoded = encode_project(&complete_project()).unwrap();
+        let version_fourteen = without_cycle_fields(&encoded, 14);
+
+        let decoded = decode_project(&version_fourteen).unwrap();
+
+        assert_eq!(decoded.cycle_range, None);
+        assert_eq!(decoded.arranger_sections.len(), 2);
+    }
+
+    #[test]
+    fn version_fifteen_keeps_cycle_and_defaults_fade_curves_linear() {
+        let encoded = encode_project(&complete_project()).unwrap();
+        let version_fifteen = without_fade_curve_fields(&encoded, 15);
+
+        let decoded = decode_project(&version_fifteen).unwrap();
+
+        assert_eq!(decoded.cycle_range, CycleRange::new(12_000, 288_000));
+        assert!(
+            decoded
+                .tracks
+                .iter()
+                .flat_map(|track| &track.clips)
+                .all(|clip| clip.fade_curve == FadeCurve::Linear)
+        );
+        assert!(
+            decoded
+                .tracks
+                .iter()
+                .flat_map(|track| &track.take_lanes)
+                .all(|take| take.fade_curve == FadeCurve::Linear)
+        );
+    }
+
+    #[test]
+    fn version_sixteen_defaults_program_changes_empty() {
+        let encoded = encode_project(&complete_project()).unwrap();
+        let version_sixteen = without_program_change_fields(&encoded, 16);
+
+        let decoded = decode_project(&version_sixteen).unwrap();
+
+        assert!(
+            decoded
+                .tracks
+                .iter()
+                .all(|track| track.midi_program_changes.is_empty())
+        );
+    }
+
+    #[test]
+    fn version_seventeen_defaults_audio_reverse_off() {
+        let encoded = encode_project(&complete_project()).unwrap();
+        let version_seventeen = without_reverse_fields(&encoded, 17);
+
+        let decoded = decode_project(&version_seventeen).unwrap();
+
+        assert!(
+            decoded
+                .tracks
+                .iter()
+                .flat_map(|track| &track.clips)
+                .all(|clip| !matches!(clip.source, ClipSource::AudioFile { reversed: true, .. }))
+        );
+        assert!(
+            decoded.tracks[1]
+                .take_lanes
+                .iter()
+                .all(|take| !take.reversed)
+        );
+    }
+
+    #[test]
+    fn version_twelve_keeps_live_midi_and_defaults_markers_empty() {
+        let encoded = encode_project(&complete_project()).unwrap();
+        let version_twelve = without_marker_fields(&encoded, 12);
+
+        let decoded = decode_project(&version_twelve).unwrap();
+
+        assert!(decoded.markers.is_empty());
+        assert_eq!(decoded.tracks[1].input, TrackInput::MidiChannel(10));
+        assert_eq!(decoded.tracks[1].midi_pitch_bend.len(), 1);
+        assert_eq!(decoded.tracks[1].midi_channel_pressure.len(), 1);
+        assert_eq!(decoded.tracks[1].midi_poly_pressure.len(), 1);
     }
 
     #[test]

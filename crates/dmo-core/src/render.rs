@@ -4,10 +4,12 @@ use std::{
     fmt,
 };
 
+use crate::soundfont::{ParsedSoundFont, load_soundfont};
 use crate::{
-    AudioFileError, AutomationPoint, ChannelInsert, ChannelOutput, ClipSource, DecodedAudio,
-    InsertEffect, Instrument, MidiChannelPressurePoint, MidiControlPoint, MidiPitchBendPoint,
-    MidiPolyPressurePoint, Project, Track, automation_value_at, decode_wav, midi_note_frequency,
+    AudioFileError, AutomationPoint, ChannelInsert, ChannelOutput, Clip, ClipSource, DecodedAudio,
+    FadeCurve, InsertEffect, Instrument, MidiChannelPressurePoint, MidiControlPoint,
+    MidiPitchBendPoint, MidiPolyPressurePoint, Project, SoundFontError, SoundFontPreset, Track,
+    automation_value_at, decode_wav, midi_note_frequency,
 };
 
 #[derive(Clone, Copy)]
@@ -24,6 +26,12 @@ struct MidiExpression<'a> {
     pitch_bend: &'a [MidiPitchBendPoint],
     channel_pressure: &'a [MidiChannelPressurePoint],
     poly_pressure: &'a [MidiPolyPressurePoint],
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ClipCrossfade {
+    fade_in: Option<(u64, u64)>,
+    fade_out: Option<(u64, u64)>,
 }
 
 impl MidiExpression<'static> {
@@ -52,11 +60,22 @@ pub enum RenderError {
         path: String,
         source: AudioFileError,
     },
+    SoundFont {
+        path: String,
+        source: SoundFontError,
+    },
     InvalidBusReference {
         track_name: String,
         bus_index: usize,
         bus_count: usize,
     },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RenderedStem {
+    pub track_index: usize,
+    pub track_name: String,
+    pub samples: Vec<f32>,
 }
 
 impl fmt::Display for RenderError {
@@ -70,6 +89,9 @@ impl fmt::Display for RenderError {
             }
             Self::AudioFile { path, source } => {
                 write!(formatter, "failed to render audio file `{path}`: {source}")
+            }
+            Self::SoundFont { path, source } => {
+                write!(formatter, "failed to render SoundFont `{path}`: {source}")
             }
             Self::InvalidBusReference {
                 track_name,
@@ -87,6 +109,7 @@ impl std::error::Error for RenderError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::AudioFile { source, .. } => Some(source),
+            Self::SoundFont { source, .. } => Some(source),
             Self::InvalidProjectSampleRate(_)
             | Self::ProjectTooLong(_)
             | Self::InvalidBusReference { .. } => None,
@@ -117,6 +140,38 @@ pub fn try_render_stereo(project: &Project) -> Result<Vec<f32>, RenderError> {
     render_stereo_impl(project, true)
 }
 
+/// Renders each audible track as an individual stereo stem through the normal
+/// channel, bus, and master processing path.
+///
+/// Muted source tracks are skipped. For each rendered stem, every other track
+/// is muted so the existing mixer and render code remains authoritative.
+///
+/// # Errors
+///
+/// Returns [`RenderError`] for the same reasons as [`try_render_stereo`].
+pub fn try_render_track_stems(project: &Project) -> Result<Vec<RenderedStem>, RenderError> {
+    let mut stems = Vec::new();
+    for (track_index, track) in project.tracks.iter().enumerate() {
+        if track.muted {
+            continue;
+        }
+        let mut stem_project = project.clone();
+        for (candidate_index, candidate) in stem_project.tracks.iter_mut().enumerate() {
+            candidate.muted = candidate_index != track_index;
+            candidate.soloed = false;
+        }
+        for bus in &mut stem_project.buses {
+            bus.soloed = false;
+        }
+        stems.push(RenderedStem {
+            track_index,
+            track_name: track.name.clone(),
+            samples: render_stereo_impl(&stem_project, true)?,
+        });
+    }
+    Ok(stems)
+}
+
 #[allow(clippy::too_many_lines)]
 fn render_stereo_impl(
     project: &Project,
@@ -139,6 +194,8 @@ fn render_stereo_impl(
 
     let mut decoded_files = HashMap::<String, DecodedAudio>::new();
     let mut unreadable_files = HashSet::<String>::new();
+    let mut soundfonts = HashMap::<String, ParsedSoundFont>::new();
+    let mut unreadable_soundfonts = HashSet::<String>::new();
     let any_soloed = project.tracks.iter().any(|track| track.soloed);
 
     for track in &project.tracks {
@@ -160,12 +217,15 @@ fn render_stereo_impl(
             automation: &[],
         };
 
-        for clip in &track.clips {
+        let crossfades = automatic_crossfades(&track.clips);
+        for (clip_index, clip) in track.clips.iter().enumerate() {
             let start = usize::try_from(clip.start_frame).unwrap_or(usize::MAX);
             let length = usize::try_from(clip.length_frames).unwrap_or(usize::MAX);
             let clip_gain = clip.gain.max(0.0);
             let fade_in = usize::try_from(clip.fade_in_frames).unwrap_or(usize::MAX);
             let fade_out = usize::try_from(clip.fade_out_frames).unwrap_or(usize::MAX);
+            let fade_curve = clip.fade_curve;
+            let crossfade = crossfades[clip_index];
             match &clip.source {
                 ClipSource::Midi { notes, amplitude } => {
                     for note in notes {
@@ -177,29 +237,82 @@ fn render_stereo_impl(
                             .saturating_sub(note.start_frame)
                             .min(note.length_frames);
                         let note_length = usize::try_from(available).unwrap_or(usize::MAX);
-                        render_tone_clip(
-                            &mut track_output,
-                            frame_count,
-                            note_start,
-                            note_length,
-                            project.sample_rate,
-                            midi_note_frequency(note.midi_note),
-                            *amplitude * f32::from(note.velocity) / 127.0,
-                            track.instrument,
-                            true,
-                            usize::try_from(note.start_frame).unwrap_or(usize::MAX),
-                            length,
-                            clip_gain,
-                            fade_in,
-                            fade_out,
-                            track_mix,
-                            MidiExpression {
-                                note: Some(note.midi_note),
-                                pitch_bend: &pitch_bend,
-                                channel_pressure: &channel_pressure,
-                                poly_pressure: &poly_pressure,
-                            },
-                        );
+                        if let Some(soundfont) = &track.soundfont {
+                            if unreadable_soundfonts.contains(&soundfont.path) {
+                                continue;
+                            }
+                            if !soundfonts.contains_key(&soundfont.path) {
+                                match load_soundfont(&soundfont.path) {
+                                    Ok(parsed) => {
+                                        soundfonts.insert(soundfont.path.clone(), parsed);
+                                    }
+                                    Err(source) if fail_on_audio_file_error => {
+                                        return Err(RenderError::SoundFont {
+                                            path: soundfont.path.clone(),
+                                            source,
+                                        });
+                                    }
+                                    Err(_) => {
+                                        unreadable_soundfonts.insert(soundfont.path.clone());
+                                        continue;
+                                    }
+                                }
+                            }
+                            if let Some(parsed) = soundfonts.get(&soundfont.path) {
+                                render_soundfont_note(
+                                    &mut track_output,
+                                    frame_count,
+                                    note_start,
+                                    note_length,
+                                    project.sample_rate,
+                                    parsed,
+                                    soundfont,
+                                    note.midi_note,
+                                    *amplitude * f32::from(note.velocity) / 127.0,
+                                    true,
+                                    usize::try_from(note.start_frame).unwrap_or(usize::MAX),
+                                    length,
+                                    clip_gain,
+                                    fade_in,
+                                    fade_out,
+                                    fade_curve,
+                                    crossfade,
+                                    track_mix,
+                                    MidiExpression {
+                                        note: Some(note.midi_note),
+                                        pitch_bend: &pitch_bend,
+                                        channel_pressure: &channel_pressure,
+                                        poly_pressure: &poly_pressure,
+                                    },
+                                );
+                            }
+                        } else {
+                            render_tone_clip(
+                                &mut track_output,
+                                frame_count,
+                                note_start,
+                                note_length,
+                                project.sample_rate,
+                                midi_note_frequency(note.midi_note),
+                                *amplitude * f32::from(note.velocity) / 127.0,
+                                track.instrument,
+                                true,
+                                usize::try_from(note.start_frame).unwrap_or(usize::MAX),
+                                length,
+                                clip_gain,
+                                fade_in,
+                                fade_out,
+                                fade_curve,
+                                crossfade,
+                                track_mix,
+                                MidiExpression {
+                                    note: Some(note.midi_note),
+                                    pitch_bend: &pitch_bend,
+                                    channel_pressure: &channel_pressure,
+                                    poly_pressure: &poly_pressure,
+                                },
+                            );
+                        }
                     }
                 }
                 ClipSource::Sine {
@@ -221,6 +334,8 @@ fn render_stereo_impl(
                         clip_gain,
                         fade_in,
                         fade_out,
+                        fade_curve,
+                        crossfade,
                         track_mix,
                         MidiExpression::NONE,
                     );
@@ -228,6 +343,7 @@ fn render_stereo_impl(
                 ClipSource::AudioFile {
                     path,
                     source_offset_frames,
+                    reversed,
                     ..
                 } => {
                     if unreadable_files.contains(path) {
@@ -258,10 +374,13 @@ fn render_stereo_impl(
                             length,
                             project.sample_rate,
                             *source_offset_frames,
+                            *reversed,
                             decoded,
                             clip_gain,
                             fade_in,
                             fade_out,
+                            fade_curve,
+                            crossfade,
                             track_mix,
                         );
                     }
@@ -534,6 +653,95 @@ fn apply_saturation(samples: &mut [f32], drive: f32, mix: f32) {
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+fn render_soundfont_note(
+    output: &mut [f32],
+    frame_count: usize,
+    start: usize,
+    length: usize,
+    sample_rate: u32,
+    soundfont: &ParsedSoundFont,
+    preset: &SoundFontPreset,
+    midi_note: u8,
+    amplitude: f32,
+    apply_envelope: bool,
+    clip_local_start: usize,
+    clip_length: usize,
+    clip_gain: f32,
+    fade_in: usize,
+    fade_out: usize,
+    fade_curve: FadeCurve,
+    crossfade: ClipCrossfade,
+    track_mix: TrackMix<'_>,
+    expression: MidiExpression<'_>,
+) {
+    let Some(voice) = soundfont.sample_for_note(preset, midi_note) else {
+        return;
+    };
+    let sample = &voice.sample;
+    if sample.end <= sample.start || sample.sample_rate == 0 {
+        return;
+    }
+    let root_key = voice.root_key.unwrap_or(sample.original_pitch);
+    let tuning = f32::from(voice.coarse_tune)
+        + f32::from(voice.fine_tune + i16::from(sample.pitch_correction)) / 100.0;
+    let mut position = f64::from(sample.start);
+    for local_frame in 0..length {
+        let frame = start.saturating_add(local_frame);
+        if frame >= frame_count {
+            break;
+        }
+        let absolute_frame = u64::try_from(frame).unwrap_or(u64::MAX);
+        let bend = latest_pitch_bend(expression.pitch_bend, absolute_frame);
+        let bend_semitones = f32::from(bend) / 8192.0 * 2.0;
+        let semitones = f32::from(midi_note) - f32::from(root_key) + tuning + bend_semitones;
+        let increment = f64::from(sample.sample_rate) / f64::from(sample_rate)
+            * f64::from(2.0_f32.powf(semitones / 12.0));
+        let sample_index = position.floor() as usize;
+        let fraction = (position - sample_index as f64) as f32;
+        let left = soundfont
+            .pcm_at(sample_index)
+            .map_or(0.0, |value| f32::from(value) / f32::from(i16::MAX));
+        let right = soundfont
+            .pcm_at(sample_index.saturating_add(1))
+            .map_or(left, |value| f32::from(value) / f32::from(i16::MAX));
+        let source = left + (right - left) * fraction;
+        let envelope = if apply_envelope {
+            note_envelope(local_frame, length, sample_rate)
+        } else {
+            1.0
+        };
+        let clip_envelope = clip_envelope(
+            clip_local_start.saturating_add(local_frame),
+            clip_length,
+            fade_in,
+            fade_out,
+            fade_curve,
+        ) * crossfade_gain(crossfade, absolute_frame, fade_curve);
+        let level = amplitude.clamp(0.0, 1.0)
+            * envelope
+            * clip_gain
+            * clip_envelope
+            * pressure_gain(expression, absolute_frame);
+        mix_stereo_frame(output, frame, source * level, source * level, track_mix);
+        position += increment;
+        if position >= f64::from(sample.end) {
+            if voice.looping && sample.loop_end > sample.loop_start {
+                let loop_length = f64::from(sample.loop_end - sample.loop_start);
+                position = f64::from(sample.loop_start)
+                    + (position - f64::from(sample.loop_start)) % loop_length;
+            } else {
+                break;
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_tone_clip(
     output: &mut [f32],
@@ -550,6 +758,8 @@ fn render_tone_clip(
     clip_gain: f32,
     fade_in: usize,
     fade_out: usize,
+    fade_curve: FadeCurve,
+    crossfade: ClipCrossfade,
     track_mix: TrackMix<'_>,
     expression: MidiExpression<'_>,
 ) {
@@ -592,6 +802,11 @@ fn render_tone_clip(
             clip_length,
             fade_in,
             fade_out,
+            fade_curve,
+        ) * crossfade_gain(
+            crossfade,
+            u64::try_from(frame).unwrap_or(u64::MAX),
+            fade_curve,
         );
         let sample = oscillator
             * amplitude.clamp(0.0, 1.0)
@@ -656,7 +871,13 @@ fn note_envelope(local_frame: usize, length: usize, sample_rate: u32) -> f32 {
     attack.min(release).min(1.0)
 }
 
-fn clip_envelope(local_frame: usize, length: usize, fade_in: usize, fade_out: usize) -> f32 {
+fn clip_envelope(
+    local_frame: usize,
+    length: usize,
+    fade_in: usize,
+    fade_out: usize,
+    fade_curve: FadeCurve,
+) -> f32 {
     if length == 0 || local_frame >= length {
         return 0.0;
     }
@@ -664,16 +885,69 @@ fn clip_envelope(local_frame: usize, length: usize, fade_in: usize, fade_out: us
     let fade_in_gain = if fade_in == 0 {
         1.0
     } else {
-        local_frame.min(fade_in) as f32 / fade_in as f32
+        fade_curve.gain(local_frame.min(fade_in) as f32 / fade_in as f32)
     };
     let remaining = length.saturating_sub(local_frame + 1);
     #[allow(clippy::cast_precision_loss)]
     let fade_out_gain = if fade_out == 0 {
         1.0
     } else {
-        remaining.min(fade_out) as f32 / fade_out as f32
+        fade_curve.gain(remaining.min(fade_out) as f32 / fade_out as f32)
     };
     fade_in_gain.min(fade_out_gain).clamp(0.0, 1.0)
+}
+
+fn automatic_crossfades(clips: &[Clip]) -> Vec<ClipCrossfade> {
+    let mut crossfades = vec![ClipCrossfade::default(); clips.len()];
+    let mut ordered = clips
+        .iter()
+        .enumerate()
+        .map(|(index, clip)| (index, clip.start_frame, clip.end_frame()))
+        .collect::<Vec<_>>();
+    ordered.sort_by_key(|(_, start, end)| (*start, *end));
+
+    for pair in ordered.windows(2) {
+        let (left_index, left_start, left_end) = pair[0];
+        let (right_index, right_start, right_end) = pair[1];
+        let overlap_start = left_start.max(right_start);
+        let overlap_end = left_end.min(right_end);
+        if overlap_end <= overlap_start {
+            continue;
+        }
+        crossfades[left_index].fade_out = Some((overlap_start, overlap_end));
+        crossfades[right_index].fade_in = Some((overlap_start, overlap_end));
+    }
+
+    crossfades
+}
+
+fn crossfade_gain(crossfade: ClipCrossfade, frame: u64, fade_curve: FadeCurve) -> f32 {
+    let fade_in = crossfade.fade_in.map_or(1.0, |(start, end)| {
+        crossfade_curve_gain(frame, start, end, fade_curve, false)
+    });
+    let fade_out = crossfade.fade_out.map_or(1.0, |(start, end)| {
+        crossfade_curve_gain(frame, start, end, fade_curve, true)
+    });
+    fade_in.min(fade_out)
+}
+
+fn crossfade_curve_gain(
+    frame: u64,
+    start: u64,
+    end: u64,
+    fade_curve: FadeCurve,
+    descending: bool,
+) -> f32 {
+    if end <= start || frame < start || frame >= end {
+        return 1.0;
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let t = (frame - start) as f32 / (end - start) as f32;
+    if descending {
+        fade_curve.gain(1.0 - t)
+    } else {
+        fade_curve.gain(t)
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -684,10 +958,13 @@ fn render_audio_file_clip(
     length: usize,
     project_sample_rate: u32,
     source_offset_frames: u64,
+    reversed: bool,
     decoded: &DecodedAudio,
     clip_gain: f32,
     fade_in: usize,
     fade_out: usize,
+    fade_curve: FadeCurve,
+    crossfade: ClipCrossfade,
     track_mix: TrackMix<'_>,
 ) {
     for local_frame in 0..length {
@@ -695,20 +972,27 @@ fn render_audio_file_clip(
         if frame >= frame_count {
             break;
         }
-        let Ok(local_frame) = u64::try_from(local_frame) else {
+        let Ok(mut source_local_frame) = u64::try_from(local_frame) else {
             break;
         };
-        let Some([left, right]) =
-            decoded.sample_at_rate(source_offset_frames, local_frame, project_sample_rate)
-        else {
+        if reversed {
+            source_local_frame =
+                u64::try_from(length.saturating_sub(local_frame + 1)).unwrap_or(u64::MAX);
+        }
+        let Some([left, right]) = decoded.sample_at_rate(
+            source_offset_frames,
+            source_local_frame,
+            project_sample_rate,
+        ) else {
             break;
         };
-        let envelope = clip_envelope(
-            usize::try_from(local_frame).unwrap_or(usize::MAX),
-            length,
-            fade_in,
-            fade_out,
-        ) * clip_gain;
+        let envelope = clip_envelope(local_frame, length, fade_in, fade_out, fade_curve)
+            * crossfade_gain(
+                crossfade,
+                u64::try_from(frame).unwrap_or(u64::MAX),
+                fade_curve,
+            )
+            * clip_gain;
         mix_stereo_frame(output, frame, left * envelope, right * envelope, track_mix);
     }
 }
@@ -747,6 +1031,7 @@ mod tests {
             gain: 1.0,
             fade_in_frames: 0,
             fade_out_frames: 0,
+            fade_curve: FadeCurve::Linear,
             source: ClipSource::Sine {
                 frequency_hz: 12_000.0,
                 amplitude: 1.0,
@@ -780,6 +1065,50 @@ mod tests {
 
         assert!((rendered[2] - 0.176_776_69).abs() < 0.000_1);
         assert!(rendered[18].abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn overlapping_track_clips_create_automatic_crossfade_regions() {
+        let mut clips = vec![
+            Clip {
+                name: "A".into(),
+                start_frame: 0,
+                length_frames: 100,
+                gain: 1.0,
+                fade_in_frames: 0,
+                fade_out_frames: 0,
+                fade_curve: FadeCurve::Linear,
+                source: ClipSource::Sine {
+                    frequency_hz: 440.0,
+                    amplitude: 0.5,
+                },
+            },
+            Clip {
+                name: "B".into(),
+                start_frame: 80,
+                length_frames: 100,
+                gain: 1.0,
+                fade_in_frames: 0,
+                fade_out_frames: 0,
+                fade_curve: FadeCurve::Linear,
+                source: ClipSource::Sine {
+                    frequency_hz: 660.0,
+                    amplitude: 0.5,
+                },
+            },
+        ];
+        clips.swap(0, 1);
+
+        let crossfades = automatic_crossfades(&clips);
+
+        assert_eq!(crossfades[0].fade_in, Some((80, 100)));
+        assert_eq!(crossfades[1].fade_out, Some((80, 100)));
+        assert!((crossfade_gain(crossfades[0], 90, FadeCurve::Linear) - 0.5).abs() < 0.001);
+        assert!((crossfade_gain(crossfades[1], 90, FadeCurve::Linear) - 0.5).abs() < 0.001);
+        assert_eq!(
+            crossfade_gain(crossfades[0], 120, FadeCurve::Linear).to_bits(),
+            1.0_f32.to_bits()
+        );
     }
 
     #[test]
@@ -842,6 +1171,35 @@ mod tests {
     }
 
     #[test]
+    fn track_stem_rendering_exports_each_unmuted_track_independently() {
+        let mut project = tone_project(false);
+        let first_track_render = render_stereo(&project);
+        let mut second = Track::new("Muted Drums");
+        second.muted = true;
+        second.clips.push(Clip {
+            name: "Drum".into(),
+            start_frame: 0,
+            length_frames: 10,
+            gain: 1.0,
+            fade_in_frames: 0,
+            fade_out_frames: 0,
+            fade_curve: FadeCurve::Linear,
+            source: ClipSource::Sine {
+                frequency_hz: 6_000.0,
+                amplitude: 1.0,
+            },
+        });
+        project.tracks.push(second);
+
+        let stems = try_render_track_stems(&project).unwrap();
+
+        assert_eq!(stems.len(), 1);
+        assert_eq!(stems[0].track_index, 0);
+        assert_eq!(stems[0].track_name, "Tone");
+        assert_eq!(stems[0].samples, first_track_render);
+    }
+
+    #[test]
     fn midi_volume_and_expression_cc_shape_the_track() {
         let mut project = tone_project(false);
         project.tracks[0].midi_cc = vec![
@@ -874,6 +1232,7 @@ mod tests {
             gain: 1.0,
             fade_in_frames: 0,
             fade_out_frames: 0,
+            fade_curve: FadeCurve::Linear,
             source: ClipSource::Midi {
                 notes: vec![
                     MidiNote {
@@ -912,6 +1271,7 @@ mod tests {
             gain: 1.0,
             fade_in_frames: 0,
             fade_out_frames: 0,
+            fade_curve: FadeCurve::Linear,
             source: ClipSource::Midi {
                 notes: vec![MidiNote {
                     start_frame: 0,
@@ -945,6 +1305,7 @@ mod tests {
             gain: 1.0,
             fade_in_frames: 0,
             fade_out_frames: 0,
+            fade_curve: FadeCurve::Linear,
             source: ClipSource::Midi {
                 notes: vec![MidiNote {
                     start_frame: 0,
@@ -1014,11 +1375,13 @@ mod tests {
             gain: 0.5,
             fade_in_frames: 0,
             fade_out_frames: 1,
+            fade_curve: FadeCurve::Linear,
             source: ClipSource::AudioFile {
                 path: path.to_string_lossy().into_owned(),
                 source_offset_frames: 0,
                 source_sample_rate: 24_000,
                 channels: 1,
+                reversed: false,
             },
         });
         project.tracks.push(track);
@@ -1087,11 +1450,13 @@ mod tests {
             gain: 1.0,
             fade_in_frames: 0,
             fade_out_frames: 0,
+            fade_curve: FadeCurve::Linear,
             source: ClipSource::AudioFile {
                 path: path.to_string_lossy().into_owned(),
                 source_offset_frames: 1,
                 source_sample_rate: 48_000,
                 channels: 1,
+                reversed: false,
             },
         });
         project.tracks.push(track);
@@ -1100,6 +1465,48 @@ mod tests {
         let _ = fs::remove_file(path);
         assert!((rendered[0] - 0.176_776_7).abs() < 0.000_1);
         assert!((rendered[2] - 0.353_553_4).abs() < 0.000_1);
+    }
+
+    #[test]
+    fn reversed_audio_file_clip_reads_the_selected_range_backwards() {
+        let path = wav_test_path("reverse");
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 48_000,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        };
+        let mut writer = hound::WavWriter::create(&path, spec).unwrap();
+        for sample in [0.0_f32, 0.25, 0.5] {
+            writer.write_sample(sample).unwrap();
+        }
+        writer.finalize().unwrap();
+
+        let mut project = Project::new("Reverse", 48_000, 120.0).unwrap();
+        let mut track = Track::new("File");
+        track.clips.push(Clip {
+            name: "Backwards".into(),
+            start_frame: 0,
+            length_frames: 3,
+            gain: 1.0,
+            fade_in_frames: 0,
+            fade_out_frames: 0,
+            fade_curve: FadeCurve::Linear,
+            source: ClipSource::AudioFile {
+                path: path.to_string_lossy().into_owned(),
+                source_offset_frames: 0,
+                source_sample_rate: 48_000,
+                channels: 1,
+                reversed: true,
+            },
+        });
+        project.tracks.push(track);
+
+        let rendered = try_render_stereo(&project).unwrap();
+        let _ = fs::remove_file(path);
+        assert!((rendered[0] - 0.353_553_4).abs() < 0.000_1);
+        assert!((rendered[2] - 0.176_776_7).abs() < 0.000_1);
+        assert!(rendered[4].abs() < 0.000_1);
     }
 
     #[test]
@@ -1115,11 +1522,13 @@ mod tests {
             gain: 1.0,
             fade_in_frames: 0,
             fade_out_frames: 0,
+            fade_curve: FadeCurve::Linear,
             source: ClipSource::AudioFile {
                 path: path.to_string_lossy().into_owned(),
                 source_offset_frames: 0,
                 source_sample_rate: 48_000,
                 channels: 2,
+                reversed: false,
             },
         });
         project.tracks.push(track);

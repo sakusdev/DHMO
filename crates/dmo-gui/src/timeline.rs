@@ -3,18 +3,27 @@
 use std::{collections::HashMap, path::Path};
 
 use dmo_core::{
-    AutomationPoint, ClipSource, Project, WaveformOverview, frequency_to_midi_note, midi_note_name,
-    rescale_frames_round,
+    AutomationPoint, ClipSource, FadeCurve, Project, WaveformOverview, frequency_to_midi_note,
+    midi_note_name, rescale_frames_round,
 };
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2};
 
 pub const RULER_HEIGHT: f32 = 30.0;
 pub const TRACK_HEIGHT: f32 = 76.0;
+const ARRANGER_COLORS: [Color32; 6] = [
+    Color32::from_rgb(79, 121, 220),
+    Color32::from_rgb(121, 91, 206),
+    Color32::from_rgb(219, 148, 70),
+    Color32::from_rgb(74, 167, 120),
+    Color32::from_rgb(202, 91, 108),
+    Color32::from_rgb(80, 154, 181),
+];
 
 #[derive(Debug, Clone, Copy)]
 pub struct TimelineView {
     pub pixels_per_second: f32,
     pub playhead_frame: u64,
+    pub cycle_range: Option<(u64, u64)>,
     pub selected_track: Option<usize>,
     pub selected_clip: Option<(usize, usize)>,
     pub draw_mode: bool,
@@ -57,6 +66,15 @@ impl TimelineView {
 
         paint_rows(&painter, rect, project.tracks.len(), self.selected_track);
         paint_ruler(&painter, rect, project.tempo_bpm, self.pixels_per_second);
+        paint_cycle_range(
+            &painter,
+            rect,
+            project.sample_rate,
+            self.cycle_range,
+            self.pixels_per_second,
+        );
+        paint_arranger_sections(&painter, rect, project, self.pixels_per_second);
+        paint_markers(&painter, rect, project, self.pixels_per_second);
         paint_clips(
             &painter,
             rect,
@@ -166,6 +184,117 @@ impl TimelineView {
             }
         }
         interaction
+    }
+}
+
+fn paint_cycle_range(
+    painter: &egui::Painter,
+    rect: Rect,
+    sample_rate: u32,
+    cycle_range: Option<(u64, u64)>,
+    pixels_per_second: f32,
+) {
+    let Some((start_frame, end_frame)) = cycle_range else {
+        return;
+    };
+    if end_frame <= start_frame {
+        return;
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let start_seconds = start_frame as f32 / sample_rate as f32;
+    #[allow(clippy::cast_precision_loss)]
+    let end_seconds = end_frame as f32 / sample_rate as f32;
+    let left = rect.left() + start_seconds * pixels_per_second;
+    let right = rect.left() + end_seconds * pixels_per_second;
+    if right < rect.left() || left > rect.right() {
+        return;
+    }
+    let range_rect = Rect::from_min_max(
+        Pos2::new(left.max(rect.left()), rect.top()),
+        Pos2::new(right.min(rect.right()).max(left + 3.0), rect.bottom()),
+    );
+    painter.rect_filled(
+        range_rect,
+        0.0,
+        Color32::from_rgba_unmultiplied(86, 132, 220, 26),
+    );
+    painter.vline(
+        left,
+        rect.y_range(),
+        Stroke::new(1.4, Color32::from_rgb(112, 154, 255)),
+    );
+    painter.vline(
+        right,
+        rect.y_range(),
+        Stroke::new(1.4, Color32::from_rgb(112, 154, 255)),
+    );
+}
+
+fn paint_arranger_sections(
+    painter: &egui::Painter,
+    rect: Rect,
+    project: &Project,
+    pixels_per_second: f32,
+) {
+    for section in &project.arranger_sections {
+        #[allow(clippy::cast_precision_loss)]
+        let start_seconds = section.start_frame as f32 / project.sample_rate as f32;
+        #[allow(clippy::cast_precision_loss)]
+        let end_seconds = section.end_frame() as f32 / project.sample_rate as f32;
+        let left = rect.left() + start_seconds * pixels_per_second;
+        let right = rect.left() + end_seconds * pixels_per_second;
+        if right < rect.left() || left > rect.right() {
+            continue;
+        }
+        let fill = ARRANGER_COLORS[usize::from(section.color_index) % ARRANGER_COLORS.len()];
+        let section_rect = Rect::from_min_max(
+            Pos2::new(left.max(rect.left()), rect.top() + 19.0),
+            Pos2::new(
+                right.min(rect.right()).max(left + 18.0),
+                rect.top() + RULER_HEIGHT - 2.0,
+            ),
+        );
+        painter.rect_filled(section_rect, 2.0, fill.gamma_multiply(0.62));
+        painter.rect_stroke(
+            section_rect,
+            2.0,
+            Stroke::new(1.0, fill),
+            StrokeKind::Inside,
+        );
+        painter.text(
+            section_rect.left_center() + Vec2::new(5.0, 0.0),
+            Align2::LEFT_CENTER,
+            section.name.as_str(),
+            FontId::monospace(9.0),
+            Color32::from_rgb(236, 240, 248),
+        );
+    }
+}
+
+fn paint_markers(painter: &egui::Painter, rect: Rect, project: &Project, pixels_per_second: f32) {
+    for marker in &project.markers {
+        #[allow(clippy::cast_precision_loss)]
+        let seconds = marker.frame as f32 / project.sample_rate as f32;
+        let x = rect.left() + seconds * pixels_per_second;
+        if x < rect.left() || x > rect.right() {
+            continue;
+        }
+        let color = Color32::from_rgb(255, 210, 96);
+        painter.vline(
+            x,
+            rect.y_range(),
+            Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 210, 96, 145)),
+        );
+        let flag = Rect::from_min_size(Pos2::new(x + 2.0, rect.top() + 4.0), Vec2::new(72.0, 18.0));
+        painter.rect_filled(flag, 2.0, Color32::from_rgb(73, 58, 29));
+        painter.rect_stroke(flag, 2.0, Stroke::new(1.0, color), StrokeKind::Inside);
+        painter.text(
+            flag.left_center() + Vec2::new(5.0, 0.0),
+            Align2::LEFT_CENTER,
+            marker.name.as_str(),
+            FontId::monospace(10.0),
+            color,
+        );
     }
 }
 
@@ -380,6 +509,7 @@ fn paint_clips(
                 clip.length_frames,
                 clip.fade_in_frames,
                 clip.fade_out_frames,
+                clip.fade_curve,
                 selected,
             );
             painter.text(
@@ -435,6 +565,62 @@ fn paint_clips(
                 );
             }
         }
+        paint_crossfade_regions(
+            painter,
+            rect,
+            project.sample_rate,
+            track_index,
+            &track.clips,
+            pixels_per_second,
+        );
+    }
+}
+
+fn paint_crossfade_regions(
+    painter: &egui::Painter,
+    rect: Rect,
+    sample_rate: u32,
+    track_index: usize,
+    clips: &[dmo_core::Clip],
+    pixels_per_second: f32,
+) {
+    let mut ordered = clips
+        .iter()
+        .map(|clip| (clip.start_frame, clip.end_frame()))
+        .collect::<Vec<_>>();
+    ordered.sort_by_key(|(start, end)| (*start, *end));
+    for pair in ordered.windows(2) {
+        let overlap_start = pair[0].0.max(pair[1].0);
+        let overlap_end = pair[0].1.min(pair[1].1);
+        if overlap_end <= overlap_start {
+            continue;
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let row_top = rect.top() + RULER_HEIGHT + track_index as f32 * TRACK_HEIGHT;
+        #[allow(clippy::cast_precision_loss)]
+        let left = rect.left() + overlap_start as f32 / sample_rate as f32 * pixels_per_second;
+        #[allow(clippy::cast_precision_loss)]
+        let right = rect.left() + overlap_end as f32 / sample_rate as f32 * pixels_per_second;
+        let region = Rect::from_min_max(
+            Pos2::new(left.max(rect.left()), row_top + 21.0),
+            Pos2::new(
+                right.min(rect.right()).max(left + 3.0),
+                row_top + TRACK_HEIGHT - 3.0,
+            ),
+        );
+        painter.rect_filled(
+            region,
+            2.0,
+            Color32::from_rgba_unmultiplied(255, 224, 120, 42),
+        );
+        painter.line_segment(
+            [region.left_top(), region.right_bottom()],
+            Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 224, 120, 165)),
+        );
+        painter.line_segment(
+            [region.left_bottom(), region.right_top()],
+            Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 224, 120, 165)),
+        );
     }
 }
 
@@ -444,6 +630,7 @@ fn paint_clip_envelope(
     length_frames: u64,
     fade_in_frames: u64,
     fade_out_frames: u64,
+    fade_curve: FadeCurve,
     selected: bool,
 ) {
     if length_frames == 0 || clip_rect.width() < 16.0 {
@@ -466,13 +653,24 @@ fn paint_clip_envelope(
     };
     let stroke = Stroke::new(if selected { 1.5 } else { 1.0 }, color);
     if fade_in_frames.saturating_add(fade_out_frames) <= length_frames {
-        painter.line_segment([Pos2::new(left, bottom), Pos2::new(fade_in_x, top)], stroke);
+        paint_fade_curve_segment(
+            painter,
+            Pos2::new(left, bottom),
+            Pos2::new(fade_in_x, top),
+            fade_curve,
+            false,
+            stroke,
+        );
         painter.line_segment(
             [Pos2::new(fade_in_x, top), Pos2::new(fade_out_x, top)],
             stroke,
         );
-        painter.line_segment(
-            [Pos2::new(fade_out_x, top), Pos2::new(right, bottom)],
+        paint_fade_curve_segment(
+            painter,
+            Pos2::new(fade_out_x, top),
+            Pos2::new(right, bottom),
+            fade_curve,
+            true,
             stroke,
         );
         if selected {
@@ -495,6 +693,39 @@ fn paint_clip_envelope(
             painter.circle_filled(peak, 2.5, color);
         }
     }
+}
+
+fn paint_fade_curve_segment(
+    painter: &egui::Painter,
+    start: Pos2,
+    end: Pos2,
+    fade_curve: FadeCurve,
+    descending: bool,
+    stroke: Stroke,
+) {
+    if (end.x - start.x).abs() < 3.0 {
+        painter.line_segment([start, end], stroke);
+        return;
+    }
+    let steps = 16;
+    let mut points = Vec::with_capacity(steps + 1);
+    for step in 0..=steps {
+        #[allow(clippy::cast_precision_loss)]
+        let t = step as f32 / steps as f32;
+        let gain = if descending {
+            fade_curve.gain(1.0 - t)
+        } else {
+            fade_curve.gain(t)
+        };
+        let x = start.x + (end.x - start.x) * t;
+        let y = bottom_lerp(start.y, end.y, gain);
+        points.push(Pos2::new(x, y));
+    }
+    painter.add(egui::Shape::line(points, stroke));
+}
+
+fn bottom_lerp(bottom: f32, top: f32, gain: f32) -> f32 {
+    bottom + (top - bottom) * gain.clamp(0.0, 1.0)
 }
 
 fn paint_midi_preview(

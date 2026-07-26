@@ -2,7 +2,7 @@ use std::{
     env,
     error::Error,
     ffi::OsString,
-    io,
+    fs, io,
     path::{Path, PathBuf},
     thread,
     time::Duration,
@@ -10,8 +10,8 @@ use std::{
 
 use dmo_audio::{Playback, default_output_device_info};
 use dmo_core::{
-    Clip, ClipSource, Instrument, MidiNote, Project, Track, load_project, save_project,
-    try_render_stereo, write_stereo_i16_wav,
+    Clip, ClipSource, Instrument, MidiNote, Project, Track, consolidate_project_media,
+    load_project, save_project, try_render_stereo, try_render_track_stems, write_stereo_i16_wav,
 };
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -32,6 +32,8 @@ fn run(args: &[OsString]) -> Result<(), Box<dyn Error>> {
         "new" => command_new(operands)?,
         "info" => command_info(operands)?,
         "render" => command_render(operands)?,
+        "stems" => command_stems(operands)?,
+        "consolidate" => command_consolidate(operands)?,
         "play" => command_play(operands)?,
         _ if args.len() == 1 => {
             // Preserve the first MVP's `dmo output.wav` behavior.
@@ -71,6 +73,43 @@ fn command_render(args: &[OsString]) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn command_consolidate(args: &[OsString]) -> Result<(), Box<dyn Error>> {
+    let (input, output_dir) = match args {
+        [input, output_dir] => (PathBuf::from(input), PathBuf::from(output_dir)),
+        _ => {
+            return Err(invalid_arguments(
+                "consolidate requires a project path and output directory",
+            ));
+        }
+    };
+    let project = load_project(&input)?;
+    let media_dir = output_dir.join("Media");
+    let consolidated = consolidate_project_media(&project, Some(&input), &media_dir)?;
+    fs::create_dir_all(&output_dir)?;
+    let output_project =
+        output_dir.join(input.file_name().unwrap_or_else(|| "project.dmo".as_ref()));
+    save_project(&output_project, &consolidated.project)?;
+    println!(
+        "Consolidated '{}' with {} media file(s) to {}",
+        project.name,
+        consolidated.copied_files,
+        output_project.display()
+    );
+    Ok(())
+}
+
+fn command_stems(args: &[OsString]) -> Result<(), Box<dyn Error>> {
+    let (project, output_dir) = match args {
+        [input, output_dir] => (load_project(input)?, PathBuf::from(output_dir)),
+        _ => {
+            return Err(invalid_arguments(
+                "stems requires a project path and output directory",
+            ));
+        }
+    };
+    render_stems(&project, &output_dir)
+}
+
 fn command_play(args: &[OsString]) -> Result<(), Box<dyn Error>> {
     let project = match args {
         [] => {
@@ -93,6 +132,30 @@ fn render_project(project: &Project, output: &Path) -> Result<(), Box<dyn Error>
         project.name,
         project.tracks.len(),
         output.display()
+    );
+    Ok(())
+}
+
+fn render_stems(project: &Project, output_dir: &Path) -> Result<(), Box<dyn Error>> {
+    fs::create_dir_all(output_dir)?;
+    let stems = try_render_track_stems(project)?;
+    for stem in &stems {
+        let filename = format!(
+            "{:02}_{}.wav",
+            stem.track_index + 1,
+            safe_filename(&stem.track_name)
+        );
+        write_stereo_i16_wav(
+            output_dir.join(filename),
+            project.sample_rate,
+            &stem.samples,
+        )?;
+    }
+    println!(
+        "Rendered {} stem(s) from '{}' to {}",
+        stems.len(),
+        project.name,
+        output_dir.display()
     );
     Ok(())
 }
@@ -122,6 +185,25 @@ fn play_project(project: &Project) -> Result<(), Box<dyn Error>> {
     thread::sleep(Duration::from_millis(100));
     println!("Playback finished");
     Ok(())
+}
+
+fn safe_filename(name: &str) -> String {
+    let sanitized = name
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    let sanitized = sanitized.trim_matches('_');
+    if sanitized.is_empty() {
+        "Track".into()
+    } else {
+        sanitized.into()
+    }
 }
 
 fn print_project_info(project: &Project, path: Option<&Path>) {
@@ -181,6 +263,8 @@ fn print_help() {
          \x20 dmo info <project.dmo>\n\
          \x20 dmo render [output.wav]\n\
          \x20 dmo render <project.dmo> <output.wav>\n\
+         \x20 dmo stems <project.dmo> <output-dir>\n\
+         \x20 dmo consolidate <project.dmo> <output-dir>\n\
          \x20 dmo play [project.dmo]\n\
          \nWith no project argument, DMO uses its built-in two-track demo."
     );
@@ -201,6 +285,7 @@ fn demo_project(sample_rate: u32) -> Result<Project, dmo_core::ProjectError> {
         gain: 1.0,
         fade_in_frames: 0,
         fade_out_frames: 0,
+        fade_curve: dmo_core::FadeCurve::Linear,
         source: ClipSource::Midi {
             notes: [60, 64, 67, 72]
                 .into_iter()
@@ -228,6 +313,7 @@ fn demo_project(sample_rate: u32) -> Result<Project, dmo_core::ProjectError> {
         gain: 1.0,
         fade_in_frames: 0,
         fade_out_frames: 0,
+        fade_curve: dmo_core::FadeCurve::Linear,
         source: ClipSource::Midi {
             notes: vec![MidiNote {
                 start_frame: 0,

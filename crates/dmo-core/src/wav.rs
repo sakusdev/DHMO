@@ -71,6 +71,86 @@ pub fn write_stereo_i16_wav(
     Ok(())
 }
 
+/// Writes interleaved stereo samples as 24-bit PCM WAV.
+///
+/// # Errors
+///
+/// Returns [`WavError`] when the sample count is not stereo-aligned, the data
+/// exceeds the WAV size limit, or the destination cannot be written.
+pub fn write_stereo_i24_wav(
+    path: impl AsRef<Path>,
+    sample_rate: u32,
+    samples: &[f32],
+) -> Result<(), WavError> {
+    if !samples.len().is_multiple_of(2) {
+        return Err(WavError::OddSampleCount(samples.len()));
+    }
+    let data_size = u32::try_from(samples.len().saturating_mul(3))
+        .map_err(|_| WavError::TooManySamples(samples.len()))?;
+    let mut file = File::create(path)?;
+    write_wav_header(&mut file, sample_rate, data_size, 1, 24, 6)?;
+    for sample in samples {
+        #[allow(clippy::cast_possible_truncation)]
+        let pcm = (sample.clamp(-1.0, 1.0) * 8_388_607.0).round() as i32;
+        let bytes = pcm.to_le_bytes();
+        file.write_all(&bytes[..3])?;
+    }
+    Ok(())
+}
+
+/// Writes interleaved stereo samples as 32-bit IEEE-float WAV.
+///
+/// # Errors
+///
+/// Returns [`WavError`] when the sample count is not stereo-aligned, the data
+/// exceeds the WAV size limit, or the destination cannot be written.
+pub fn write_stereo_f32_wav(
+    path: impl AsRef<Path>,
+    sample_rate: u32,
+    samples: &[f32],
+) -> Result<(), WavError> {
+    if !samples.len().is_multiple_of(2) {
+        return Err(WavError::OddSampleCount(samples.len()));
+    }
+    let data_size = u32::try_from(samples.len().saturating_mul(4))
+        .map_err(|_| WavError::TooManySamples(samples.len()))?;
+    let mut file = File::create(path)?;
+    write_wav_header(&mut file, sample_rate, data_size, 3, 32, 8)?;
+    for sample in samples {
+        file.write_all(&sample.to_le_bytes())?;
+    }
+    Ok(())
+}
+
+fn write_wav_header(
+    file: &mut File,
+    sample_rate: u32,
+    data_size: u32,
+    format: u16,
+    bits_per_sample: u16,
+    block_align: u16,
+) -> Result<(), WavError> {
+    let riff_size = 36_u32
+        .checked_add(data_size)
+        .ok_or(WavError::TooManySamples(
+            usize::try_from(data_size).unwrap_or(usize::MAX),
+        ))?;
+    let byte_rate = sample_rate.saturating_mul(u32::from(block_align));
+    file.write_all(b"RIFF")?;
+    file.write_all(&riff_size.to_le_bytes())?;
+    file.write_all(b"WAVEfmt ")?;
+    file.write_all(&16_u32.to_le_bytes())?;
+    file.write_all(&format.to_le_bytes())?;
+    file.write_all(&2_u16.to_le_bytes())?;
+    file.write_all(&sample_rate.to_le_bytes())?;
+    file.write_all(&byte_rate.to_le_bytes())?;
+    file.write_all(&block_align.to_le_bytes())?;
+    file.write_all(&bits_per_sample.to_le_bytes())?;
+    file.write_all(b"data")?;
+    file.write_all(&data_size.to_le_bytes())?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -86,5 +166,22 @@ mod tests {
         assert_eq!(&bytes[0..4], b"RIFF");
         assert_eq!(&bytes[8..12], b"WAVE");
         assert_eq!(bytes.len(), 52);
+    }
+
+    #[test]
+    fn writes_24_bit_and_float_wav_headers() {
+        let base = std::env::temp_dir().join(format!("dmo-wav-format-test-{}", std::process::id()));
+        let pcm_path = base.with_extension("pcm.wav");
+        let float_path = base.with_extension("float.wav");
+        write_stereo_i24_wav(&pcm_path, 48_000, &[0.0, 0.0]).unwrap();
+        write_stereo_f32_wav(&float_path, 48_000, &[0.0, 0.0]).unwrap();
+        let pcm = fs::read(&pcm_path).unwrap();
+        let float = fs::read(&float_path).unwrap();
+        let _ = fs::remove_file(pcm_path);
+        let _ = fs::remove_file(float_path);
+        assert_eq!(&pcm[20..22], &1_u16.to_le_bytes());
+        assert_eq!(&pcm[34..36], &24_u16.to_le_bytes());
+        assert_eq!(&float[20..22], &3_u16.to_le_bytes());
+        assert_eq!(&float[34..36], &32_u16.to_le_bytes());
     }
 }

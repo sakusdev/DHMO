@@ -6,6 +6,13 @@ pub struct Project {
     pub name: String,
     pub sample_rate: u32,
     pub tempo_bpm: f64,
+    pub time_signature: TimeSignature,
+    /// Optional persistent cycle/loop range used by playback and punch recording.
+    pub cycle_range: Option<CycleRange>,
+    /// Timeline markers used for navigation and arrangement notes.
+    pub markers: Vec<Marker>,
+    /// Named song sections shown on the arranger lane.
+    pub arranger_sections: Vec<ArrangerSection>,
     /// Linear gain applied at the master output after all track mixing.
     pub master_gain: f32,
     /// Insert processing applied after all buses and before the master gain.
@@ -38,6 +45,10 @@ impl Project {
             name: name.into(),
             sample_rate,
             tempo_bpm,
+            time_signature: TimeSignature::default(),
+            cycle_range: None,
+            markers: Vec::new(),
+            arranger_sections: Vec::new(),
             master_gain: 1.0,
             master_inserts: Vec::new(),
             buses: Vec::new(),
@@ -62,6 +73,110 @@ impl Project {
     }
 }
 
+/// A project-wide musical meter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimeSignature {
+    pub numerator: u8,
+    pub denominator: u8,
+}
+
+impl TimeSignature {
+    pub const COMMON_DENOMINATORS: [u8; 5] = [2, 4, 8, 16, 32];
+
+    #[must_use]
+    pub const fn new(numerator: u8, denominator: u8) -> Option<Self> {
+        if numerator == 0 || numerator > 32 || !matches!(denominator, 2 | 4 | 8 | 16 | 32) {
+            return None;
+        }
+        Some(Self {
+            numerator,
+            denominator,
+        })
+    }
+
+    #[must_use]
+    pub const fn beats_per_bar(self) -> u8 {
+        self.numerator
+    }
+}
+
+impl Default for TimeSignature {
+    fn default() -> Self {
+        Self {
+            numerator: 4,
+            denominator: 4,
+        }
+    }
+}
+
+/// A saved song cycle range spanning a half-open timeline range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CycleRange {
+    pub start_frame: u64,
+    pub end_frame: u64,
+}
+
+impl CycleRange {
+    #[must_use]
+    pub const fn new(start_frame: u64, end_frame: u64) -> Option<Self> {
+        if end_frame <= start_frame {
+            return None;
+        }
+        Some(Self {
+            start_frame,
+            end_frame,
+        })
+    }
+
+    #[must_use]
+    pub const fn length_frames(self) -> u64 {
+        self.end_frame - self.start_frame
+    }
+}
+
+/// A named song section spanning a half-open timeline range.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArrangerSection {
+    pub name: String,
+    pub start_frame: u64,
+    pub length_frames: u64,
+    pub color_index: u8,
+}
+
+impl ArrangerSection {
+    #[must_use]
+    pub fn new(name: impl Into<String>, start_frame: u64, length_frames: u64) -> Self {
+        Self {
+            name: name.into(),
+            start_frame,
+            length_frames: length_frames.max(1),
+            color_index: 0,
+        }
+    }
+
+    #[must_use]
+    pub const fn end_frame(&self) -> u64 {
+        self.start_frame.saturating_add(self.length_frames)
+    }
+}
+
+/// A named timeline location in absolute project frames.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Marker {
+    pub name: String,
+    pub frame: u64,
+}
+
+impl Marker {
+    #[must_use]
+    pub fn new(name: impl Into<String>, frame: u64) -> Self {
+        Self {
+            name: name.into(),
+            frame,
+        }
+    }
+}
+
 /// A stereo mixer channel containing timeline clips.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Track {
@@ -81,6 +196,8 @@ pub struct Track {
     pub inserts: Vec<ChannelInsert>,
     /// Built-in instrument used by MIDI clips on this track.
     pub instrument: Instrument,
+    /// Optional `SoundFont` preset used instead of the built-in oscillator.
+    pub soundfont: Option<SoundFontPreset>,
     /// Logical MIDI channel in the conventional 1..=16 range.
     pub midi_channel: u8,
     /// Sample-accurate MIDI continuous-controller events on this track.
@@ -91,6 +208,8 @@ pub struct Track {
     pub midi_channel_pressure: Vec<MidiChannelPressurePoint>,
     /// Per-note polyphonic pressure (aftertouch) events.
     pub midi_poly_pressure: Vec<MidiPolyPressurePoint>,
+    /// MIDI program-change events selecting external patches by channel.
+    pub midi_program_changes: Vec<MidiProgramChangePoint>,
     /// Linear gain multipliers interpolated across the project timeline.
     pub volume_automation: Vec<AutomationPoint>,
     /// Alternate audio recordings retained below the main comp lane.
@@ -117,11 +236,13 @@ impl Track {
             sends: Vec::new(),
             inserts: Vec::new(),
             instrument: Instrument::Sine,
+            soundfont: None,
             midi_channel: 1,
             midi_cc: Vec::new(),
             midi_pitch_bend: Vec::new(),
             midi_channel_pressure: Vec::new(),
             midi_poly_pressure: Vec::new(),
+            midi_program_changes: Vec::new(),
             volume_automation: Vec::new(),
             take_lanes: Vec::new(),
             clips: Vec::new(),
@@ -132,6 +253,40 @@ impl Track {
     #[must_use]
     pub fn automation_gain_at(&self, frame: u64) -> f32 {
         automation_value_at(&self.volume_automation, frame)
+    }
+}
+
+/// A selectable preset contained in an SF2 `SoundFont` file.
+///
+/// The sample data stays in the external `SoundFont` file; projects only keep
+/// the path and stable bank/program address so they remain compact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SoundFontPreset {
+    pub path: String,
+    pub bank: u16,
+    pub program: u16,
+    pub name: String,
+}
+
+impl SoundFontPreset {
+    #[must_use]
+    pub fn new(path: impl Into<String>, bank: u16, program: u16, name: impl Into<String>) -> Self {
+        Self {
+            path: path.into(),
+            bank,
+            program,
+            name: name.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn label(&self) -> String {
+        format!(
+            "{} · Bank {} Program {}",
+            self.name,
+            self.bank,
+            self.program + 1
+        )
     }
 }
 
@@ -191,6 +346,14 @@ pub struct MidiPolyPressurePoint {
     pub frame: u64,
     pub note: u8,
     pub value: u8,
+}
+
+/// A MIDI program-change event at an absolute project frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MidiProgramChangePoint {
+    pub frame: u64,
+    /// Conventional 1..=128 program number shown in the UI.
+    pub program: u8,
 }
 
 /// Returns the last controller value at or before `frame`.
@@ -347,10 +510,12 @@ pub struct AudioTake {
     pub gain: f32,
     pub fade_in_frames: u64,
     pub fade_out_frames: u64,
+    pub fade_curve: FadeCurve,
     pub path: String,
     pub source_offset_frames: u64,
     pub source_sample_rate: u32,
     pub channels: u16,
+    pub reversed: bool,
 }
 
 impl AudioTake {
@@ -362,6 +527,7 @@ impl AudioTake {
             source_offset_frames,
             source_sample_rate,
             channels,
+            reversed,
         } = &clip.source
         else {
             return None;
@@ -373,10 +539,12 @@ impl AudioTake {
             gain: clip.gain,
             fade_in_frames: clip.fade_in_frames,
             fade_out_frames: clip.fade_out_frames,
+            fade_curve: clip.fade_curve,
             path: path.clone(),
             source_offset_frames: *source_offset_frames,
             source_sample_rate: *source_sample_rate,
             channels: *channels,
+            reversed: *reversed,
         })
     }
 
@@ -390,11 +558,13 @@ impl AudioTake {
             gain: self.gain,
             fade_in_frames: self.fade_in_frames,
             fade_out_frames: self.fade_out_frames,
+            fade_curve: self.fade_curve,
             source: ClipSource::AudioFile {
                 path: self.path.clone(),
                 source_offset_frames: self.source_offset_frames,
                 source_sample_rate: self.source_sample_rate,
                 channels: self.channels,
+                reversed: self.reversed,
             },
         }
     }
@@ -482,6 +652,8 @@ pub struct Clip {
     pub fade_in_frames: u64,
     /// Non-destructive fade-out duration in project frames.
     pub fade_out_frames: u64,
+    /// Shape used by both fade-in and fade-out envelopes.
+    pub fade_curve: FadeCurve,
     pub source: ClipSource,
 }
 
@@ -489,6 +661,51 @@ impl Clip {
     #[must_use]
     pub const fn end_frame(&self) -> u64 {
         self.start_frame.saturating_add(self.length_frames)
+    }
+}
+
+/// Per-clip non-destructive fade curve shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FadeCurve {
+    #[default]
+    Linear,
+    EqualPower,
+    Slow,
+    Fast,
+}
+
+impl FadeCurve {
+    pub const ALL: [Self; 4] = [Self::Linear, Self::EqualPower, Self::Slow, Self::Fast];
+
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Linear => "Linear",
+            Self::EqualPower => "Equal Power",
+            Self::Slow => "Slow",
+            Self::Fast => "Fast",
+        }
+    }
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Linear => "linear",
+            Self::EqualPower => "equal_power",
+            Self::Slow => "slow",
+            Self::Fast => "fast",
+        }
+    }
+
+    #[must_use]
+    pub fn gain(self, normalized: f32) -> f32 {
+        let t = normalized.clamp(0.0, 1.0);
+        match self {
+            Self::Linear => t,
+            Self::EqualPower => (t * std::f32::consts::FRAC_PI_2).sin(),
+            Self::Slow => t * t,
+            Self::Fast => 1.0 - (1.0 - t) * (1.0 - t),
+        }
     }
 }
 
@@ -512,6 +729,7 @@ pub enum ClipSource {
         source_offset_frames: u64,
         source_sample_rate: u32,
         channels: u16,
+        reversed: bool,
     },
 }
 
@@ -537,6 +755,7 @@ impl MidiNote {
 pub enum ProjectError {
     InvalidSampleRate(u32),
     InvalidTempo(f64),
+    InvalidTimeSignature { numerator: u8, denominator: u8 },
 }
 
 impl fmt::Display for ProjectError {
@@ -544,6 +763,13 @@ impl fmt::Display for ProjectError {
         match self {
             Self::InvalidSampleRate(rate) => write!(formatter, "invalid sample rate: {rate}"),
             Self::InvalidTempo(tempo) => write!(formatter, "invalid tempo: {tempo}"),
+            Self::InvalidTimeSignature {
+                numerator,
+                denominator,
+            } => write!(
+                formatter,
+                "invalid time signature: {numerator}/{denominator}"
+            ),
         }
     }
 }
@@ -565,6 +791,7 @@ mod tests {
             gain: 1.0,
             fade_in_frames: 0,
             fade_out_frames: 0,
+            fade_curve: FadeCurve::Linear,
             source: ClipSource::Sine {
                 frequency_hz: 440.0,
                 amplitude: 0.5,
@@ -627,5 +854,17 @@ mod tests {
         assert_eq!(midi_controller_value_at(&points, 11, 0, 127), 127);
         assert_eq!(midi_controller_value_at(&points, 11, 25, 127), 64);
         assert_eq!(midi_controller_value_at(&points, 11, 30, 127), 100);
+    }
+
+    #[test]
+    fn fade_curves_have_distinct_shapes() {
+        let midpoint = 0.5;
+
+        assert!((FadeCurve::Linear.gain(midpoint) - 0.5).abs() < f32::EPSILON);
+        assert!(FadeCurve::Slow.gain(midpoint) < FadeCurve::Linear.gain(midpoint));
+        assert!(FadeCurve::Fast.gain(midpoint) > FadeCurve::Linear.gain(midpoint));
+        assert!(FadeCurve::EqualPower.gain(midpoint) > FadeCurve::Linear.gain(midpoint));
+        assert_eq!(FadeCurve::Linear.gain(-1.0).to_bits(), 0.0_f32.to_bits());
+        assert_eq!(FadeCurve::Linear.gain(2.0).to_bits(), 1.0_f32.to_bits());
     }
 }

@@ -2,7 +2,7 @@ use std::{collections::HashMap, fmt, fs, path::Path};
 
 use crate::{
     ClipSource, MidiChannelPressurePoint, MidiControlPoint, MidiNote, MidiPitchBendPoint,
-    MidiPolyPressurePoint, Project, frequency_to_midi_note,
+    MidiPolyPressurePoint, MidiProgramChangePoint, Project, frequency_to_midi_note,
 };
 
 pub const MIDI_TICKS_PER_QUARTER: u16 = 960;
@@ -18,6 +18,7 @@ pub struct ImportedMidiTrack {
     pub pitch_bend: Vec<MidiPitchBendPoint>,
     pub channel_pressure: Vec<MidiChannelPressurePoint>,
     pub poly_pressure: Vec<MidiPolyPressurePoint>,
+    pub program_changes: Vec<MidiProgramChangePoint>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -81,6 +82,7 @@ struct RawTrack {
     pitch_bend: HashMap<u8, Vec<(u64, i16)>>,
     channel_pressure: HashMap<u8, Vec<(u64, u8)>>,
     poly_pressure: HashMap<u8, Vec<(u64, u8, u8)>>,
+    program_changes: HashMap<u8, Vec<(u64, u8)>>,
     tempos: Vec<(u64, u32)>,
     end_tick: u64,
 }
@@ -166,6 +168,7 @@ pub fn decode_midi(
             .chain(raw.pitch_bend.keys())
             .chain(raw.channel_pressure.keys())
             .chain(raw.poly_pressure.keys())
+            .chain(raw.program_changes.keys())
             .copied()
             .collect::<Vec<_>>();
         channels.sort_unstable();
@@ -242,6 +245,17 @@ pub fn decode_midi(
                 })
                 .collect::<Vec<_>>();
             poly_pressure.sort_by_key(|point| (point.frame, point.note));
+            let mut program_changes = raw
+                .program_changes
+                .get(&channel)
+                .into_iter()
+                .flatten()
+                .map(|(tick, program)| MidiProgramChangePoint {
+                    frame: ticks_to_frames(*tick, division, sample_rate, conversion_tempo),
+                    program: program.saturating_add(1).clamp(1, 128),
+                })
+                .collect::<Vec<_>>();
+            program_changes.sort_by_key(|point| point.frame);
             let channel_duration = notes
                 .iter()
                 .map(|note| note.end_frame())
@@ -249,6 +263,7 @@ pub fn decode_midi(
                 .chain(pitch_bend.iter().map(|point| point.frame))
                 .chain(channel_pressure.iter().map(|point| point.frame))
                 .chain(poly_pressure.iter().map(|point| point.frame))
+                .chain(program_changes.iter().map(|point| point.frame))
                 .max()
                 .unwrap_or_else(|| {
                     ticks_to_frames(raw.end_tick, division, sample_rate, conversion_tempo)
@@ -271,6 +286,7 @@ pub fn decode_midi(
                 pitch_bend,
                 channel_pressure,
                 poly_pressure,
+                program_changes,
             });
         }
     }
@@ -317,6 +333,7 @@ pub fn encode_project_midi(project: &Project) -> Result<Vec<u8>, MidiFileError> 
                 || !track.midi_pitch_bend.is_empty()
                 || !track.midi_channel_pressure.is_empty()
                 || !track.midi_poly_pressure.is_empty()
+                || !track.midi_program_changes.is_empty()
                 || track.clips.iter().any(|clip| {
                     matches!(
                         clip.source,
@@ -414,6 +431,11 @@ fn parse_track(bytes: &[u8], track_index: usize) -> Result<RawTrack, MidiFileErr
                         first.min(127),
                         second.min(127),
                     )),
+                    0xC0 => result
+                        .program_changes
+                        .entry(channel)
+                        .or_default()
+                        .push((tick, first.min(127))),
                     0xA0 => result.poly_pressure.entry(channel).or_default().push((
                         tick,
                         first.min(127),
@@ -616,6 +638,13 @@ fn encode_track(project: &Project, track: &crate::Track) -> Result<Vec<u8>, Midi
             bytes: vec![0xA0 | channel, point.note.min(127), point.value.min(127)],
         });
     }
+    for point in &track.midi_program_changes {
+        events.push(MidiEvent {
+            tick: frames_to_ticks(point.frame, project),
+            priority: 1,
+            bytes: vec![0xC0 | channel, point.program.clamp(1, 128) - 1],
+        });
+    }
     events.sort_by_key(|event| (event.tick, event.priority));
 
     let mut encoded = Vec::new();
@@ -729,7 +758,7 @@ fn write_vlq(output: &mut Vec<u8>, value: u32) -> Result<(), MidiFileError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Clip, ClipSource, Track};
+    use crate::{Clip, ClipSource, FadeCurve, Track};
 
     #[test]
     fn format_one_round_trips_notes_cc_tempo_and_track_names() {
@@ -754,6 +783,10 @@ mod tests {
             note: 64,
             value: 73,
         });
+        track.midi_program_changes.push(MidiProgramChangePoint {
+            frame: 10_000,
+            program: 42,
+        });
         track.clips.push(Clip {
             name: "Part".into(),
             start_frame: 24_000,
@@ -761,6 +794,7 @@ mod tests {
             gain: 1.0,
             fade_in_frames: 0,
             fade_out_frames: 0,
+            fade_curve: FadeCurve::Linear,
             source: ClipSource::Midi {
                 notes: vec![MidiNote {
                     start_frame: 0,
@@ -789,6 +823,7 @@ mod tests {
         assert_eq!(decoded.tracks[0].channel_pressure[0].value, 87);
         assert_eq!(decoded.tracks[0].poly_pressure[0].note, 64);
         assert_eq!(decoded.tracks[0].poly_pressure[0].value, 73);
+        assert_eq!(decoded.tracks[0].program_changes[0].program, 42);
     }
 
     #[test]

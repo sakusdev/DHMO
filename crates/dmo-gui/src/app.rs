@@ -1,7 +1,7 @@
 //! Main DMO desktop application.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet, VecDeque},
     fs,
     path::{Path, PathBuf},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -9,13 +9,18 @@ use std::{
 
 use dmo_audio::{Playback, Recording as AudioRecording, default_output_device_info};
 use dmo_core::{
-    AudioTake, AutomationPoint, Clip, ClipSource, EditCommand, EditHistory, Instrument,
-    MidiChannelPressurePoint, MidiControlPoint, MidiNote, MidiPitchBendPoint,
-    MidiPolyPressurePoint, Project, QuantizeOptions, Track, TrackInput, WaveformOverview,
-    adjust_note_velocities, decode_wav_overview, frequency_to_midi_note, humanize_notes,
-    import_wav_with_overview, load_midi, load_project, make_notes_legato, midi_note_frequency,
-    midi_note_name, quantize_notes, remove_note_overlaps, rescale_frames_round, save_project,
-    save_project_midi, transpose_notes, try_render_stereo, write_stereo_i16_wav,
+    ArrangerSection, AudioTake, AutomationPoint, Bus, ChannelInsert, ChannelOutput, Clip,
+    ClipSource, CycleRange, EditCommand, EditHistory, FadeCurve, GrooveQuantizeOptions,
+    GrooveTemplate, InsertEffect, Instrument, Marker, MidiChannelPressurePoint, MidiControlPoint,
+    MidiNote, MidiPitchBendPoint, MidiPolyPressurePoint, MidiProgramChangePoint, MidiScale,
+    Project, QuantizeOptions, SoundFontPreset, SwingQuantizeOptions, TimeSignature, Track,
+    TrackInput, TrackSend, WaveformOverview, adjust_note_velocities, conform_notes_to_scale,
+    consolidate_project_media, decode_wav, decode_wav_overview, frequency_to_midi_note,
+    groove_quantize_notes, humanize_notes, import_wav_with_overview, inspect_soundfont, load_midi,
+    load_project, make_notes_legato, midi_note_frequency, midi_note_name, quantize_notes,
+    remove_note_overlaps, rescale_frames_round, save_project, save_project_midi, set_note_lengths,
+    swing_quantize_notes, transpose_notes, try_render_stereo, try_render_track_stems,
+    write_stereo_f32_wav, write_stereo_i16_wav, write_stereo_i24_wav,
 };
 use eframe::egui::{self, Color32, RichText};
 
@@ -29,6 +34,15 @@ use crate::{
 };
 
 const WAVEFORM_PEAKS: usize = 2_048;
+const RETROSPECTIVE_MIDI_SECONDS: u64 = 30;
+const ARRANGER_COLORS: [Color32; 6] = [
+    Color32::from_rgb(79, 121, 220),
+    Color32::from_rgb(121, 91, 206),
+    Color32::from_rgb(219, 148, 70),
+    Color32::from_rgb(74, 167, 120),
+    Color32::from_rgb(202, 91, 108),
+    Color32::from_rgb(80, 154, 181),
+];
 
 pub struct DmoApp {
     project: Project,
@@ -52,14 +66,18 @@ pub struct DmoApp {
     selected_midi_output_port: Option<usize>,
     midi_output_playback: MidiOutputPlayback,
     last_midi_activity: Option<Instant>,
+    retrospective_midi: VecDeque<RetrospectiveMidiEvent>,
     metronome_enabled: bool,
     loop_enabled: bool,
     loop_start_frame: u64,
     loop_end_frame: u64,
-    waveforms: HashMap<String, WaveformOverview>,
+    waveforms: HashMap<String, CachedWaveform>,
     waveform_errors: HashMap<String, String>,
+    waveform_fingerprints: HashMap<String, AudioFileFingerprint>,
+    soundfont_presets: HashMap<String, Vec<SoundFontPreset>>,
     piano_roll: PianoRollState,
     arrange: ArrangeState,
+    view: AppView,
     dirty: bool,
     status: StatusMessage,
 }
@@ -74,6 +92,23 @@ struct ActiveRecording {
     end_frame: Option<u64>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AppView {
+    Start,
+    Editor,
+}
+
+#[derive(Debug, Clone)]
+struct CachedWaveform {
+    overview: WaveformOverview,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AudioFileFingerprint {
+    len: u64,
+    modified: Option<SystemTime>,
+}
+
 struct ActiveMidiTake {
     track_index: usize,
     input: TrackInput,
@@ -83,6 +118,13 @@ struct ActiveMidiTake {
     pitch_bend: Vec<MidiPitchBendPoint>,
     channel_pressure: Vec<MidiChannelPressurePoint>,
     poly_pressure: Vec<MidiPolyPressurePoint>,
+    program_changes: Vec<MidiProgramChangePoint>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RetrospectiveMidiEvent {
+    received_at: Instant,
+    event: ParsedLiveMidi,
 }
 
 #[derive(Debug, Clone)]
@@ -145,6 +187,10 @@ enum ParsedLiveMidi {
         note: u8,
         value: u8,
     },
+    ProgramChange {
+        channel: u8,
+        program: u8,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -176,11 +222,16 @@ enum MidiPlaybackEvent {
         note: u8,
         value: u8,
     },
+    ProgramChange {
+        channel: u8,
+        program: u8,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
 struct RecordingOptions {
     punch_enabled: bool,
+    cycle_take_recording: bool,
     pre_roll_bars: u8,
 }
 
@@ -188,6 +239,7 @@ impl Default for RecordingOptions {
     fn default() -> Self {
         Self {
             punch_enabled: false,
+            cycle_take_recording: false,
             pre_roll_bars: 1,
         }
     }
@@ -197,6 +249,12 @@ impl Default for RecordingOptions {
 struct MidiToolsState {
     quantize_strength: u8,
     quantize_ends: bool,
+    swing_percent: u8,
+    groove_template: GrooveTemplate,
+    groove_amount: u8,
+    scale_root: u8,
+    scale: MidiScale,
+    note_length_grid: SnapGrid,
     humanize_timing_ms: f32,
     humanize_velocity: u8,
     humanize_seed: u64,
@@ -204,6 +262,7 @@ struct MidiToolsState {
     cc_value: u8,
     pitch_bend: i16,
     channel_pressure: u8,
+    program_change: u8,
 }
 
 impl Default for MidiToolsState {
@@ -211,6 +270,12 @@ impl Default for MidiToolsState {
         Self {
             quantize_strength: 100,
             quantize_ends: false,
+            swing_percent: 60,
+            groove_template: GrooveTemplate::Mpc16,
+            groove_amount: 60,
+            scale_root: 0,
+            scale: MidiScale::Major,
+            note_length_grid: SnapGrid::Sixteenth,
             humanize_timing_ms: 8.0,
             humanize_velocity: 6,
             humanize_seed: 1,
@@ -218,6 +283,7 @@ impl Default for MidiToolsState {
             cc_value: 127,
             pitch_bend: 0,
             channel_pressure: 0,
+            program_change: 1,
         }
     }
 }
@@ -288,7 +354,9 @@ enum UiAction {
     Open,
     Save,
     SaveAs,
-    Export,
+    ExportMixdown(ExportAudioFormat),
+    ExportStems,
+    ConsolidateProject,
     ImportWav,
     ImportMidi,
     ExportMidi,
@@ -296,11 +364,35 @@ enum UiAction {
     Redo,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum ExportAudioFormat {
+    Wav16,
+    Wav24,
+    WavFloat32,
+}
+
+impl ExportAudioFormat {
+    const ALL: [Self; 3] = [Self::Wav16, Self::Wav24, Self::WavFloat32];
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Wav16 => "WAV 16-bit PCM",
+            Self::Wav24 => "WAV 24-bit PCM",
+            Self::WavFloat32 => "WAV 32-bit float",
+        }
+    }
+}
+
 impl DmoApp {
     pub fn new(creation_context: &eframe::CreationContext<'_>) -> Self {
         configure_theme(&creation_context.egui_ctx);
         let sample_rate = default_output_device_info().map_or(48_000, |info| info.sample_rate);
         let requested_project = std::env::args_os().nth(1).map(PathBuf::from);
+        let view = if requested_project.is_none() {
+            AppView::Start
+        } else {
+            AppView::Editor
+        };
         let (project, project_path, status) = requested_project.map_or_else(
             || {
                 (
@@ -331,7 +423,12 @@ impl DmoApp {
                 ),
             },
         );
-        let loop_end_frame = project.duration_frames();
+        let default_loop_end_frame = project.duration_frames().max(1);
+        let loop_start_frame = project.cycle_range.map_or(0, |range| range.start_frame);
+        let loop_end_frame = project
+            .cycle_range
+            .map_or(default_loop_end_frame, |range| range.end_frame);
+        let loop_enabled = project.cycle_range.is_some();
         let selected_clip = first_clip_selection(&project);
         let selected_track = selected_clip
             .map(|(track_index, _)| track_index)
@@ -361,12 +458,15 @@ impl DmoApp {
             selected_midi_output_port: None,
             midi_output_playback: MidiOutputPlayback::new(),
             last_midi_activity: None,
+            retrospective_midi: VecDeque::new(),
             metronome_enabled: false,
-            loop_enabled: false,
-            loop_start_frame: 0,
+            loop_enabled,
+            loop_start_frame,
             loop_end_frame,
             waveforms: HashMap::new(),
             waveform_errors: HashMap::new(),
+            waveform_fingerprints: HashMap::new(),
+            soundfont_presets: HashMap::new(),
             piano_roll: PianoRollState {
                 open: true,
                 scroll_to_selection: true,
@@ -376,12 +476,82 @@ impl DmoApp {
                 snap_enabled: true,
                 snap_grid: SnapGrid::Sixteenth,
             },
+            view,
             dirty: false,
             status,
         };
         app.repair_edit_state();
         app.refresh_waveforms();
         app
+    }
+
+    fn start_screen(&mut self, ui: &mut egui::Ui) {
+        let mut create_project = false;
+        let mut open_project = false;
+        let mut open_demo = false;
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(Color32::from_rgb(20, 23, 30)))
+            .show(ui, |ui| {
+                ui.add_space((ui.available_height() * 0.17).max(24.0));
+                ui.vertical_centered(|ui| {
+                    ui.label(
+                        RichText::new("DMO")
+                            .size(44.0)
+                            .strong()
+                            .color(Color32::from_rgb(116, 151, 255)),
+                    );
+                    ui.label(
+                        RichText::new("Digital Music Observatory")
+                            .size(15.0)
+                            .color(Color32::from_gray(180)),
+                    );
+                    ui.add_space(28.0);
+                    egui::Frame::new()
+                        .fill(Color32::from_rgb(30, 34, 43))
+                        .stroke(egui::Stroke::new(1.0, Color32::from_rgb(58, 65, 80)))
+                        .corner_radius(10.0)
+                        .inner_margin(egui::Margin::symmetric(26, 22))
+                        .show(ui, |ui| {
+                            ui.set_width(330.0);
+                            ui.heading("Start creating");
+                            ui.add_space(8.0);
+                            if ui
+                                .add_sized([278.0, 38.0], egui::Button::new("New project"))
+                                .clicked()
+                            {
+                                create_project = true;
+                            }
+                            if ui
+                                .add_sized([278.0, 34.0], egui::Button::new("Open project…"))
+                                .clicked()
+                            {
+                                open_project = true;
+                            }
+                            ui.add_space(8.0);
+                            ui.separator();
+                            ui.add_space(6.0);
+                            if ui
+                                .add_sized([278.0, 30.0], egui::Button::new("Explore demo session"))
+                                .clicked()
+                            {
+                                open_demo = true;
+                            }
+                        });
+                    ui.add_space(20.0);
+                    ui.small("SF2 instruments · MIDI editing · audio recording · stem export");
+                    ui.small("Open source DAW · Rust edition");
+                });
+            });
+        if create_project {
+            self.new_project();
+        } else if open_project {
+            self.open_project_dialog();
+        } else if open_demo {
+            let sample_rate = default_output_device_info().map_or(48_000, |info| info.sample_rate);
+            self.replace_project(demo_project(sample_rate), None, false);
+            self.view = AppView::Editor;
+            self.status_ok("Opened the demo session");
+        }
     }
 
     #[allow(clippy::too_many_lines)]
@@ -400,8 +570,30 @@ impl DmoApp {
                 menu_action(ui, "Save", &mut action, UiAction::Save);
                 menu_action(ui, "Save as…", &mut action, UiAction::SaveAs);
                 ui.separator();
-                menu_action(ui, "Export WAV…", &mut action, UiAction::Export);
+                ui.menu_button("Export mixdown", |ui| {
+                    for format in ExportAudioFormat::ALL {
+                        menu_action(
+                            ui,
+                            format.label(),
+                            &mut action,
+                            UiAction::ExportMixdown(format),
+                        );
+                    }
+                });
+                menu_action(
+                    ui,
+                    "Export stems (WAV 16-bit)…",
+                    &mut action,
+                    UiAction::ExportStems,
+                );
                 menu_action(ui, "Export MIDI…", &mut action, UiAction::ExportMidi);
+                ui.separator();
+                menu_action(
+                    ui,
+                    "Consolidate Project…",
+                    &mut action,
+                    UiAction::ConsolidateProject,
+                );
             });
             ui.menu_button("Edit", |ui| {
                 if ui
@@ -636,6 +828,7 @@ impl DmoApp {
     #[allow(clippy::too_many_lines)]
     fn transport_bar(&mut self, ui: &mut egui::Ui) {
         let mut tempo_change = None;
+        let mut signature_change = None;
         ui.horizontal(|ui| {
             let status_color = if self.status.error {
                 Color32::from_rgb(255, 125, 125)
@@ -675,8 +868,19 @@ impl DmoApp {
                     self.start_recording();
                 }
             }
+            if ui
+                .add_enabled(
+                    !is_recording && !self.retrospective_midi.is_empty(),
+                    egui::Button::new("Capture MIDI"),
+                )
+                .on_hover_text("Create a MIDI clip from the last 30 seconds of live input")
+                .clicked()
+            {
+                self.capture_retrospective_midi();
+            }
             let loop_response = ui.toggle_value(&mut self.loop_enabled, "↻ Loop");
             if loop_response.changed() {
+                self.write_cycle_range_from_transport();
                 self.sync_playback_loop();
             }
             if ui
@@ -695,11 +899,11 @@ impl DmoApp {
                 .on_hover_text("Set loop start to playhead")
                 .clicked()
             {
-                self.loop_start_frame = self
+                let start = self
                     .playhead_frame
                     .min(self.loop_end_frame.saturating_sub(1));
+                self.set_cycle_range(start, self.loop_end_frame);
                 self.loop_enabled = true;
-                self.sync_playback_loop();
                 self.status_ok("Loop start set");
             }
             if ui
@@ -707,16 +911,42 @@ impl DmoApp {
                 .on_hover_text("Set loop end to playhead")
                 .clicked()
             {
-                self.loop_end_frame = self
+                let end = self
                     .playhead_frame
                     .max(self.loop_start_frame.saturating_add(1));
+                self.set_cycle_range(self.loop_start_frame, end);
                 self.loop_enabled = true;
-                self.sync_playback_loop();
                 self.status_ok("Loop end set");
+            }
+            if ui
+                .small_button("|<M")
+                .on_hover_text("Previous marker")
+                .clicked()
+            {
+                self.seek_previous_marker();
+            }
+            if ui
+                .small_button("M+")
+                .on_hover_text("Add marker at playhead")
+                .clicked()
+            {
+                self.add_marker_at_playhead();
+            }
+            if ui
+                .small_button("M>|")
+                .on_hover_text("Next marker")
+                .clicked()
+            {
+                self.seek_next_marker();
             }
             ui.add_enabled_ui(self.loop_enabled && self.recording.is_none(), |ui| {
                 ui.toggle_value(&mut self.recording_options.punch_enabled, "Punch")
                     .on_hover_text("Record only inside the L/R loop range");
+                ui.toggle_value(
+                    &mut self.recording_options.cycle_take_recording,
+                    "Cycle Takes",
+                )
+                .on_hover_text("Record repeated L/R passes as alternate take lanes until stopped");
             });
             ui.add_enabled_ui(self.recording.is_none(), |ui| {
                 egui::ComboBox::from_id_salt("pre_roll_bars")
@@ -753,6 +983,7 @@ impl DmoApp {
                         self.playhead_frame,
                         self.project.sample_rate,
                         self.project.tempo_bpm,
+                        self.project.time_signature,
                     ))
                     .monospace()
                     .size(17.0)
@@ -783,7 +1014,34 @@ impl DmoApp {
                 ui.small("TEMPO");
             });
             ui.vertical(|ui| {
-                ui.label(RichText::new("4 / 4").monospace().size(14.0));
+                let mut numerator = self.project.time_signature.numerator;
+                let mut denominator = self.project.time_signature.denominator;
+                ui.horizontal(|ui| {
+                    if ui
+                        .add(egui::DragValue::new(&mut numerator).range(1..=32).speed(1))
+                        .changed()
+                    {
+                        signature_change = TimeSignature::new(numerator, denominator);
+                    }
+                    ui.label("/");
+                    egui::ComboBox::from_id_salt("time_signature_denominator")
+                        .selected_text(denominator.to_string())
+                        .width(44.0)
+                        .show_ui(ui, |ui| {
+                            for candidate in TimeSignature::COMMON_DENOMINATORS {
+                                if ui
+                                    .selectable_value(
+                                        &mut denominator,
+                                        candidate,
+                                        candidate.to_string(),
+                                    )
+                                    .changed()
+                                {
+                                    signature_change = TimeSignature::new(numerator, denominator);
+                                }
+                            }
+                        });
+                });
                 ui.small("SIGNATURE");
             });
 
@@ -803,6 +1061,13 @@ impl DmoApp {
         if let Some(tempo_bpm) = tempo_change {
             self.apply_edit(EditCommand::SetTempo { tempo_bpm });
             self.status_ok(format!("Tempo {tempo_bpm:.2} BPM"));
+        }
+        if let Some(time_signature) = signature_change {
+            self.apply_edit(EditCommand::SetTimeSignature { time_signature });
+            self.status_ok(format!(
+                "Time signature {}/{}",
+                time_signature.numerator, time_signature.denominator
+            ));
         }
     }
 
@@ -828,6 +1093,8 @@ impl DmoApp {
             });
 
         let mut delete_track = None;
+        let mut bounce_track = None;
+        let mut freeze_track = None;
         for index in 0..self.project.tracks.len() {
             let track = &self.project.tracks[index];
             let name = track.name.clone();
@@ -839,6 +1106,7 @@ impl DmoApp {
             let mut pan = track.pan;
             let instrument = track.instrument;
             let midi_channel = track.midi_channel;
+            let meter = estimate_track_meter(track, self.playhead_frame);
             let selected = self.selected_track == Some(index);
             let mut mute_changed = false;
             let mut solo_changed = false;
@@ -885,6 +1153,20 @@ impl DmoApp {
                             if ui.small_button("×").on_hover_text("Delete track").clicked() {
                                 delete_track = Some(index);
                             }
+                            if ui
+                                .small_button("B")
+                                .on_hover_text("Bounce this track to a new audio track")
+                                .clicked()
+                            {
+                                bounce_track = Some(index);
+                            }
+                            if ui
+                                .small_button("F")
+                                .on_hover_text("Freeze this track to audio and mute the source")
+                                .clicked()
+                            {
+                                freeze_track = Some(index);
+                            }
                         });
                     });
                     ui.horizontal(|ui| {
@@ -925,6 +1207,11 @@ impl DmoApp {
                                 egui::Slider::new(&mut pan, -1.0..=1.0).show_value(false),
                             )
                             .changed();
+                    });
+                    ui.horizontal(|ui| {
+                        ui.add_space(27.0);
+                        ui.label(RichText::new("LVL").monospace().size(9.0));
+                        level_meter(ui, meter, 105.0);
                     });
                 });
             let row_rect = row.response.rect;
@@ -975,6 +1262,14 @@ impl DmoApp {
             }
         }
 
+        if let Some(track_index) = bounce_track {
+            self.render_track_to_new_audio_track(track_index, false);
+        }
+
+        if let Some(track_index) = freeze_track {
+            self.render_track_to_new_audio_track(track_index, true);
+        }
+
         if let Some(track_index) = delete_track {
             self.apply_edit(EditCommand::DeleteTrack { track_index });
             self.selected_track = self
@@ -988,6 +1283,7 @@ impl DmoApp {
 
         let mut master_gain = self.project.master_gain;
         let mut master_changed = false;
+        let master_meter = estimate_master_meter(&self.project, self.playhead_frame);
         egui::Frame::new()
             .fill(Color32::from_rgb(20, 24, 31))
             .stroke(egui::Stroke::new(1.0, Color32::from_rgb(58, 65, 78)))
@@ -1008,6 +1304,7 @@ impl DmoApp {
                         egui::Slider::new(&mut master_gain, 0.0..=1.5).show_value(false),
                     )
                     .changed();
+                level_meter(ui, master_meter, 170.0);
             });
         if master_changed {
             self.apply_edit(EditCommand::SetMasterGain { gain: master_gain });
@@ -1031,6 +1328,7 @@ impl DmoApp {
     fn inspector(&mut self, ui: &mut egui::Ui) {
         ui.heading("Inspector");
         let mut duplicate_track = None;
+        let mut load_soundfont_track = None;
         if let Some(track_index) = self.selected_track
             && let Some(track) = self.project.tracks.get(track_index)
         {
@@ -1048,6 +1346,36 @@ impl DmoApp {
                         }
                     });
             });
+            ui.horizontal(|ui| {
+                ui.label("SoundFont");
+                if ui.button("Load SF2…").clicked() {
+                    load_soundfont_track = Some(track_index);
+                }
+                if ui.small_button("Clear").clicked() {
+                    edited.soundfont = None;
+                }
+            });
+            if let Some(selected) = &edited.soundfont {
+                let options = self.soundfont_presets.get(&selected.path);
+                if let Some(options) = options {
+                    egui::ComboBox::from_id_salt(("soundfont_preset", track_index))
+                        .width(190.0)
+                        .selected_text(selected.label())
+                        .show_ui(ui, |ui| {
+                            for preset in options {
+                                ui.selectable_value(
+                                    &mut edited.soundfont,
+                                    Some(preset.clone()),
+                                    preset.label(),
+                                );
+                            }
+                        });
+                } else {
+                    ui.small(selected.label());
+                }
+            } else {
+                ui.small("Built-in oscillator");
+            }
             ui.horizontal(|ui| {
                 ui.label("MIDI channel");
                 ui.add(egui::DragValue::new(&mut edited.midi_channel).range(1..=16));
@@ -1089,6 +1417,12 @@ impl DmoApp {
                     );
                 });
             }
+            ui.add_space(4.0);
+            ui.collapsing("Routing, sends & inserts", |ui| {
+                track_routing_editor(ui, track_index, &mut edited, &self.project.buses);
+                ui.separator();
+                insert_chain_editor(ui, ("track_inserts", track_index), &mut edited.inserts);
+            });
             ui.add_space(4.0);
             ui.label("MIDI CC lane");
             ui.horizontal(|ui| {
@@ -1260,6 +1594,50 @@ impl DmoApp {
                         edited.midi_channel_pressure.remove(index);
                     }
                 });
+
+                let program_index = edited
+                    .midi_program_changes
+                    .iter()
+                    .position(|point| point.frame == self.playhead_frame);
+                let mut program = program_index.map_or(self.midi_tools.program_change, |index| {
+                    edited.midi_program_changes[index].program
+                });
+                if ui
+                    .add(egui::Slider::new(&mut program, 1..=128).text("Program"))
+                    .changed()
+                {
+                    self.midi_tools.program_change = program;
+                    if let Some(index) = program_index {
+                        edited.midi_program_changes[index].program = program;
+                    }
+                }
+                ui.horizontal(|ui| {
+                    if ui
+                        .button(if program_index.is_some() {
+                            "Update program"
+                        } else {
+                            "Write program"
+                        })
+                        .clicked()
+                    {
+                        if let Some(index) = program_index {
+                            edited.midi_program_changes[index].program = program;
+                        } else {
+                            edited.midi_program_changes.push(MidiProgramChangePoint {
+                                frame: self.playhead_frame,
+                                program,
+                            });
+                            edited.midi_program_changes.sort_by_key(|point| point.frame);
+                        }
+                    }
+                    if ui
+                        .add_enabled(program_index.is_some(), egui::Button::new("Delete"))
+                        .clicked()
+                        && let Some(index) = program_index
+                    {
+                        edited.midi_program_changes.remove(index);
+                    }
+                });
             });
             if ui.button("Duplicate track").clicked() {
                 let mut copy = edited.clone();
@@ -1337,11 +1715,20 @@ impl DmoApp {
                 });
             }
         }
+        if let Some(track_index) = load_soundfont_track {
+            self.import_soundfont_for_track(track_index);
+        }
         if let Some((index, track)) = duplicate_track {
             self.apply_edit(EditCommand::AddTrack { index, track });
             self.selected_track = Some(index);
             self.selected_clip = None;
         }
+        ui.separator();
+        self.arranger_inspector(ui);
+        ui.separator();
+        self.marker_inspector(ui);
+        ui.separator();
+        self.mixer_inspector(ui);
         ui.separator();
         let mut changed = false;
         let mut trim_left = false;
@@ -1352,6 +1739,8 @@ impl DmoApp {
         let mut split_clip = false;
         let mut use_take = None;
         let mut delete_take = None;
+        let mut relink_audio = false;
+        let mut normalize_audio = false;
         let mut original_clip = None;
         if let Some((track_index, clip_index)) = self.selected_clip {
             let take_rows = self
@@ -1455,6 +1844,15 @@ impl DmoApp {
                     changed = true;
                 }
             });
+            egui::ComboBox::from_id_salt("clip_fade_curve")
+                .selected_text(clip.fade_curve.label())
+                .show_ui(ui, |ui| {
+                    for curve in FadeCurve::ALL {
+                        changed |= ui
+                            .selectable_value(&mut clip.fade_curve, curve, curve.label())
+                            .changed();
+                    }
+                });
             let playhead_inside =
                 self.playhead_frame > clip.start_frame && self.playhead_frame < clip.end_frame();
             let is_audio_file = matches!(clip.source, ClipSource::AudioFile { .. });
@@ -1494,6 +1892,7 @@ impl DmoApp {
                     source_offset_frames,
                     source_sample_rate,
                     channels,
+                    reversed,
                 } => {
                     ui.add_space(8.0);
                     ui.label("Linked WAV audio");
@@ -1505,9 +1904,79 @@ impl DmoApp {
                     ui.label(format!(
                         "{source_sample_rate} Hz · {channels} ch · source offset {source_offset_frames}"
                     ));
+                    changed |= ui
+                        .toggle_value(reversed, "Reverse")
+                        .on_hover_text("Play this audio clip backwards without rewriting the WAV")
+                        .changed();
+                    let source_frames = self
+                        .waveforms
+                        .get(path)
+                        .map(|cached| cached.overview.source_frames);
+                    let max_offset = source_frames.map_or(u64::MAX / 2, |frames| {
+                        frames.saturating_sub(1).max(*source_offset_frames)
+                    });
+                    let slip_project_frames = grid_note_frames(
+                        self.project.sample_rate,
+                        self.project.tempo_bpm,
+                        self.arrange.snap_grid,
+                    );
+                    ui.label(RichText::new("Slip edit").strong());
+                    ui.horizontal(|ui| {
+                        if ui
+                            .small_button("Slip -grid")
+                            .on_hover_text(
+                                "Move the visible audio content earlier without moving the clip",
+                            )
+                            .clicked()
+                        {
+                            *source_offset_frames = slipped_source_offset(
+                                *source_offset_frames,
+                                -i64::try_from(slip_project_frames).unwrap_or(i64::MAX),
+                                self.project.sample_rate,
+                                *source_sample_rate,
+                                source_frames,
+                            );
+                            changed = true;
+                        }
+                        if ui
+                            .small_button("Slip +grid")
+                            .on_hover_text(
+                                "Move the visible audio content later without moving the clip",
+                            )
+                            .clicked()
+                        {
+                            *source_offset_frames = slipped_source_offset(
+                                *source_offset_frames,
+                                i64::try_from(slip_project_frames).unwrap_or(i64::MAX),
+                                self.project.sample_rate,
+                                *source_sample_rate,
+                                source_frames,
+                            );
+                            changed = true;
+                        }
+                    });
+                    changed |= ui
+                        .add(
+                            egui::DragValue::new(source_offset_frames)
+                                .range(0..=max_offset)
+                                .speed(f64::from(*source_sample_rate) / 100.0)
+                                .prefix("Offset ")
+                                .suffix(" src frames"),
+                        )
+                        .changed();
                     if let Some(error) = self.waveform_errors.get(path) {
                         ui.colored_label(Color32::from_rgb(255, 125, 125), error);
                     }
+                    relink_audio = ui
+                        .button("Relink WAV…")
+                        .on_hover_text("Replace the referenced WAV while keeping clip timing")
+                        .clicked();
+                    normalize_audio = ui
+                        .button("Normalize gain")
+                        .on_hover_text(
+                            "Set clip gain from the selected audio range peak without rewriting the WAV",
+                        )
+                        .clicked();
                 }
             }
             if is_audio_file && !take_rows.is_empty() {
@@ -1594,6 +2063,12 @@ impl DmoApp {
                 clip_index,
                 clip: edited,
             });
+        }
+        if relink_audio {
+            self.relink_selected_audio_clip();
+        }
+        if normalize_audio {
+            self.normalize_selected_audio_clip();
         }
         if trim_left
             && let Some(command) = clip_trim_command(
@@ -1775,6 +2250,91 @@ impl DmoApp {
         self.status_ok("Comped selected section from alternate take");
     }
 
+    fn render_track_to_new_audio_track(&mut self, track_index: usize, freeze_source: bool) {
+        let Some(source_track) = self.project.tracks.get(track_index) else {
+            return;
+        };
+        if source_track.muted {
+            self.status_error("Unmute the track before rendering it to audio");
+            return;
+        }
+        if source_track.clips.is_empty() || self.project.duration_frames() == 0 {
+            self.status_error("The selected track has no audio to render");
+            return;
+        }
+        let stems = match try_render_track_stems(&self.project) {
+            Ok(stems) => stems,
+            Err(error) => {
+                self.status_error(error);
+                return;
+            }
+        };
+        let Some(stem) = stems
+            .into_iter()
+            .find(|stem| stem.track_index == track_index)
+        else {
+            self.status_error("Could not render the selected track stem");
+            return;
+        };
+        let path = match bounce_output_path(
+            self.project_path.as_deref(),
+            &self.project.name,
+            &stem.track_name,
+        ) {
+            Ok(path) => path,
+            Err(error) => {
+                self.status_error(error);
+                return;
+            }
+        };
+        if let Err(error) = write_stereo_i16_wav(&path, self.project.sample_rate, &stem.samples) {
+            self.status_error(format!(
+                "Could not write bounce {}: {error}",
+                path.display()
+            ));
+            return;
+        }
+
+        let render_label = if freeze_source { "Freeze" } else { "Bounce" };
+        let mut bounced = Track::new(format!("{} {render_label}", stem.track_name));
+        bounced.clips.push(Clip {
+            name: format!("{} {render_label}", stem.track_name),
+            start_frame: 0,
+            length_frames: self.project.duration_frames(),
+            gain: 1.0,
+            fade_in_frames: 0,
+            fade_out_frames: 0,
+            fade_curve: FadeCurve::Linear,
+            source: ClipSource::AudioFile {
+                path: path.to_string_lossy().into_owned(),
+                source_offset_frames: 0,
+                source_sample_rate: self.project.sample_rate,
+                channels: 2,
+                reversed: false,
+            },
+        });
+        let index = self.project.tracks.len();
+        self.apply_edit(EditCommand::AddTrack {
+            index,
+            track: bounced,
+        });
+        if freeze_source {
+            self.apply_edit(EditCommand::SetTrackMuted {
+                track_index,
+                muted: true,
+            });
+        }
+        self.selected_track = Some(index);
+        self.selected_clip = Some((index, 0));
+        self.selected_note = None;
+        self.refresh_waveforms();
+        if freeze_source {
+            self.status_ok(format!("Froze {} to {}", stem.track_name, path.display()));
+        } else {
+            self.status_ok(format!("Bounced {} to {}", stem.track_name, path.display()));
+        }
+    }
+
     fn timeline(&mut self, ui: &mut egui::Ui) {
         egui::ScrollArea::horizontal()
             .auto_shrink([false, false])
@@ -1782,11 +2342,19 @@ impl DmoApp {
                 let interaction = TimelineView {
                     pixels_per_second: self.pixels_per_second,
                     playhead_frame: self.playhead_frame,
+                    cycle_range: self
+                        .loop_enabled
+                        .then_some((self.loop_start_frame, self.loop_end_frame)),
                     selected_track: self.selected_track,
                     selected_clip: self.selected_clip,
                     draw_mode: self.arrange.tool == EditTool::Draw,
                 }
-                .show(ui, &self.project, &self.waveforms, &self.waveform_errors);
+                .show(
+                    ui,
+                    &self.project,
+                    &self.waveform_overviews(),
+                    &self.waveform_errors,
+                );
 
                 if let Some(frame) = interaction.seek_frame {
                     if interaction.selected_clip.is_none() {
@@ -1825,9 +2393,13 @@ impl DmoApp {
     #[allow(clippy::too_many_lines)]
     fn piano_roll(&mut self, ui: &mut egui::Ui) {
         let mut quantize = false;
+        let mut swing_quantize = false;
+        let mut groove_quantize = false;
         let mut humanize = false;
         let mut legato = false;
         let mut cleanup = false;
+        let mut scale_quantize = false;
+        let mut set_length = false;
         let mut transpose = None;
         let mut velocity_change = None;
         ui.horizontal(|ui| {
@@ -1856,8 +2428,34 @@ impl DmoApp {
                         .text("Strength %"),
                 );
                 ui.checkbox(&mut self.midi_tools.quantize_ends, "Quantize note ends");
-                if ui.button("Apply to part").clicked() {
+                ui.add(
+                    egui::Slider::new(&mut self.midi_tools.swing_percent, 50..=75).text("Swing %"),
+                );
+                egui::ComboBox::from_label("Groove")
+                    .selected_text(self.midi_tools.groove_template.label())
+                    .show_ui(ui, |ui| {
+                        for template in GrooveTemplate::ALL {
+                            ui.selectable_value(
+                                &mut self.midi_tools.groove_template,
+                                template,
+                                template.label(),
+                            );
+                        }
+                    });
+                ui.add(
+                    egui::Slider::new(&mut self.midi_tools.groove_amount, 0..=100)
+                        .text("Groove amt %"),
+                );
+                if ui.button("Apply straight").clicked() {
                     quantize = true;
+                    ui.close();
+                }
+                if ui.button("Apply swing").clicked() {
+                    swing_quantize = true;
+                    ui.close();
+                }
+                if ui.button("Apply groove").clicked() {
+                    groove_quantize = true;
                     ui.close();
                 }
             });
@@ -1878,6 +2476,47 @@ impl DmoApp {
             if ui.small_button("Vel +5").clicked() {
                 velocity_change = Some(5);
             }
+            ui.menu_button("Scale", |ui| {
+                egui::ComboBox::from_label("Root")
+                    .selected_text(pitch_class_name(self.midi_tools.scale_root))
+                    .show_ui(ui, |ui| {
+                        for root in 0..12 {
+                            ui.selectable_value(
+                                &mut self.midi_tools.scale_root,
+                                root,
+                                pitch_class_name(root),
+                            );
+                        }
+                    });
+                egui::ComboBox::from_label("Scale")
+                    .selected_text(self.midi_tools.scale.label())
+                    .show_ui(ui, |ui| {
+                        for scale in MidiScale::ALL {
+                            ui.selectable_value(&mut self.midi_tools.scale, scale, scale.label());
+                        }
+                    });
+                if ui.button("Conform selected/part").clicked() {
+                    scale_quantize = true;
+                    ui.close();
+                }
+            });
+            ui.menu_button("Length", |ui| {
+                egui::ComboBox::from_label("Note length")
+                    .selected_text(self.midi_tools.note_length_grid.label())
+                    .show_ui(ui, |ui| {
+                        for grid in SnapGrid::ALL {
+                            ui.selectable_value(
+                                &mut self.midi_tools.note_length_grid,
+                                grid,
+                                grid.label(),
+                            );
+                        }
+                    });
+                if ui.button("Set selected/part").clicked() {
+                    set_length = true;
+                    ui.close();
+                }
+            });
             if ui
                 .button("Legato")
                 .on_hover_text("Extend notes/chords to the next note start")
@@ -1912,11 +2551,23 @@ impl DmoApp {
         if quantize {
             self.quantize_selected_midi_clip();
         }
+        if swing_quantize {
+            self.swing_quantize_selected_midi_clip();
+        }
+        if groove_quantize {
+            self.groove_quantize_selected_midi_clip();
+        }
         if let Some(semitones) = transpose {
             self.transpose_selected_midi(semitones);
         }
         if let Some(amount) = velocity_change {
             self.adjust_selected_midi_velocity(amount);
+        }
+        if scale_quantize {
+            self.conform_selected_midi_to_scale();
+        }
+        if set_length {
+            self.set_selected_midi_note_lengths();
         }
         if legato {
             self.edit_selected_midi_clip("Made MIDI part legato", |notes| {
@@ -2062,6 +2713,39 @@ impl DmoApp {
         });
     }
 
+    fn swing_quantize_selected_midi_clip(&mut self) {
+        let options = SwingQuantizeOptions {
+            grid_frames: grid_note_frames(
+                self.project.sample_rate,
+                self.project.tempo_bpm,
+                self.arrange.snap_grid,
+            ),
+            strength: self.midi_tools.quantize_strength,
+            swing_percent: self.midi_tools.swing_percent,
+            quantize_ends: self.midi_tools.quantize_ends,
+        };
+        self.edit_selected_midi_clip("Swing-quantized MIDI part", |notes| {
+            swing_quantize_notes(notes, options);
+        });
+    }
+
+    fn groove_quantize_selected_midi_clip(&mut self) {
+        let options = GrooveQuantizeOptions {
+            grid_frames: grid_note_frames(
+                self.project.sample_rate,
+                self.project.tempo_bpm,
+                self.arrange.snap_grid,
+            ),
+            strength: self.midi_tools.quantize_strength,
+            amount: self.midi_tools.groove_amount,
+            template: self.midi_tools.groove_template,
+            quantize_ends: self.midi_tools.quantize_ends,
+        };
+        self.edit_selected_midi_clip("Groove-quantized MIDI part", |notes| {
+            groove_quantize_notes(notes, options);
+        });
+    }
+
     fn humanize_selected_midi_clip(&mut self) {
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let timing_frames = (f64::from(self.project.sample_rate)
@@ -2085,6 +2769,25 @@ impl DmoApp {
     fn adjust_selected_midi_velocity(&mut self, amount: i16) {
         self.edit_selected_midi_subset("Adjusted MIDI velocity", |notes| {
             adjust_note_velocities(notes, amount);
+        });
+    }
+
+    fn conform_selected_midi_to_scale(&mut self) {
+        let root = self.midi_tools.scale_root;
+        let scale = self.midi_tools.scale;
+        self.edit_selected_midi_subset("Conformed MIDI to scale", |notes| {
+            conform_notes_to_scale(notes, root, scale);
+        });
+    }
+
+    fn set_selected_midi_note_lengths(&mut self) {
+        let length_frames = grid_note_frames(
+            self.project.sample_rate,
+            self.project.tempo_bpm,
+            self.midi_tools.note_length_grid,
+        );
+        self.edit_selected_midi_subset("Set MIDI note lengths", |notes| {
+            set_note_lengths(notes, length_frames);
         });
     }
 
@@ -2119,6 +2822,12 @@ impl DmoApp {
         } else {
             edit(notes);
         }
+        clip.length_frames = notes
+            .iter()
+            .map(|note| note.end_frame())
+            .max()
+            .unwrap_or(1)
+            .max(1);
         self.apply_edit(EditCommand::ReplaceClip {
             track_index,
             clip_index,
@@ -2309,6 +3018,7 @@ impl DmoApp {
                     gain: 1.0,
                     fade_in_frames: 0,
                     fade_out_frames: 0,
+                    fade_curve: FadeCurve::Linear,
                     source: ClipSource::Midi {
                         notes: vec![MidiNote {
                             start_frame: 0,
@@ -2446,6 +3156,7 @@ impl DmoApp {
             let Some(event) = parse_live_midi(message) else {
                 continue;
             };
+            self.push_retrospective_midi_event(message.received_at, event);
             let sample_rate = self.project.sample_rate;
             if let Some(recording) = &mut self.recording {
                 let frame = recording
@@ -2462,6 +3173,16 @@ impl DmoApp {
                 }
             }
         }
+    }
+
+    fn push_retrospective_midi_event(&mut self, received_at: Instant, event: ParsedLiveMidi) {
+        self.retrospective_midi
+            .push_back(RetrospectiveMidiEvent { received_at, event });
+        prune_retrospective_midi(
+            &mut self.retrospective_midi,
+            received_at,
+            Duration::from_secs(RETROSPECTIVE_MIDI_SECONDS),
+        );
     }
 
     fn update_recording(&mut self, ui: &egui::Ui) {
@@ -2520,6 +3241,7 @@ impl DmoApp {
                     pitch_bend: Vec::new(),
                     channel_pressure: Vec::new(),
                     poly_pressure: Vec::new(),
+                    program_changes: Vec::new(),
                 })
             })
             .collect::<Vec<_>>();
@@ -2531,10 +3253,20 @@ impl DmoApp {
             self.status_error("Enable Loop and set L/R before punch recording");
             return;
         }
+        if self.recording_options.cycle_take_recording && !self.loop_enabled {
+            self.status_error("Enable Loop and set L/R before cycle take recording");
+            return;
+        }
+        if self.recording_options.punch_enabled && self.recording_options.cycle_take_recording {
+            self.status_error("Use Punch or Cycle Takes, not both at once");
+            return;
+        }
         let monitoring = audio_track_indices
             .iter()
             .any(|index| self.project.tracks[*index].recording.input_monitoring);
-        let record_start_frame = if self.recording_options.punch_enabled {
+        let record_start_frame = if self.recording_options.punch_enabled
+            || self.recording_options.cycle_take_recording
+        {
             self.loop_start_frame
         } else {
             self.playhead_frame
@@ -2547,6 +3279,7 @@ impl DmoApp {
             self.recording_options.pre_roll_bars,
             self.project.sample_rate,
             self.project.tempo_bpm,
+            self.project.time_signature,
         );
         let capture_start_frame = record_start_frame.saturating_sub(requested_pre_roll);
         self.invalidate_playback();
@@ -2599,12 +3332,20 @@ impl DmoApp {
         self.playback = prepared_playback;
         if let Some(playback) = &self.playback {
             let handle = playback.handle();
-            handle.clear_loop();
+            if self.recording_options.cycle_take_recording {
+                let start = usize::try_from(self.loop_start_frame).unwrap_or(0);
+                let end = usize::try_from(self.loop_end_frame).unwrap_or(handle.duration_frames());
+                let _ = handle.set_loop(start, end.min(handle.duration_frames()));
+            } else {
+                handle.clear_loop();
+            }
             handle.play();
         }
         let pre_roll_bars = self.recording_options.pre_roll_bars;
         self.status_ok(if self.recording_options.punch_enabled {
             format!("Punch recording from {source} · pre-roll {pre_roll_bars} bar(s)")
+        } else if self.recording_options.cycle_take_recording {
+            format!("Cycle-take recording from {source} · pre-roll {pre_roll_bars} bar(s)")
         } else {
             format!("Recording from {source} · pre-roll {pre_roll_bars} bar(s)")
         });
@@ -2674,30 +3415,48 @@ impl DmoApp {
                     }
                 };
                 let stored_path = path.to_string_lossy().into_owned();
-                self.waveforms.insert(stored_path.clone(), overview);
+                self.cache_waveform(&stored_path, &path, overview);
                 let clip_name = path.file_stem().map_or_else(
                     || "Recorded Take".into(),
                     |name| name.to_string_lossy().into_owned(),
                 );
                 let length_frames = u64::try_from(frame_count).unwrap_or(u64::MAX);
                 for track_index in recording.audio_track_indices {
-                    let clip = Clip {
-                        name: clip_name.clone(),
-                        start_frame: recording.record_start_frame,
-                        length_frames,
-                        gain: 1.0,
-                        fade_in_frames: 0,
-                        fade_out_frames: 0,
-                        source: ClipSource::AudioFile {
-                            path: stored_path.clone(),
-                            source_offset_frames: 0,
-                            source_sample_rate: captured.device_info.sample_rate,
-                            channels: 2,
-                        },
-                    };
                     let mut track = self.project.tracks[track_index].clone();
-                    let clip_index =
-                        comp_recording_into_track(&mut track, clip, self.project.sample_rate);
+                    let clip_index = if self.recording_options.cycle_take_recording {
+                        comp_loop_recording_into_track(
+                            &mut track,
+                            LoopRecordingSource {
+                                base_name: &clip_name,
+                                path: &stored_path,
+                                source_sample_rate: captured.device_info.sample_rate,
+                                project_sample_rate: self.project.sample_rate,
+                                channels: 2,
+                                record_start_frame: recording.record_start_frame,
+                                recorded_length_frames: length_frames,
+                                loop_start_frame: self.loop_start_frame,
+                                loop_end_frame: self.loop_end_frame,
+                            },
+                        )
+                    } else {
+                        let clip = Clip {
+                            name: clip_name.clone(),
+                            start_frame: recording.record_start_frame,
+                            length_frames,
+                            gain: 1.0,
+                            fade_in_frames: 0,
+                            fade_out_frames: 0,
+                            fade_curve: FadeCurve::Linear,
+                            source: ClipSource::AudioFile {
+                                path: stored_path.clone(),
+                                source_offset_frames: 0,
+                                source_sample_rate: captured.device_info.sample_rate,
+                                channels: 2,
+                                reversed: false,
+                            },
+                        };
+                        comp_recording_into_track(&mut track, clip, self.project.sample_rate)
+                    };
                     self.apply_edit(EditCommand::ReplaceTrack { track_index, track });
                     first_selection.get_or_insert((track_index, clip_index));
                 }
@@ -2712,6 +3471,7 @@ impl DmoApp {
                 && take.pitch_bend.is_empty()
                 && take.channel_pressure.is_empty()
                 && take.poly_pressure.is_empty()
+                && take.program_changes.is_empty()
             {
                 continue;
             }
@@ -2734,6 +3494,8 @@ impl DmoApp {
             track
                 .midi_poly_pressure
                 .sort_by_key(|point| (point.frame, point.note));
+            track.midi_program_changes.append(&mut take.program_changes);
+            track.midi_program_changes.sort_by_key(|point| point.frame);
             track.clips.push(Clip {
                 name: format!("MIDI Take {}", clip_index + 1),
                 start_frame: recording.record_start_frame,
@@ -2741,6 +3503,7 @@ impl DmoApp {
                 gain: 1.0,
                 fade_in_frames: 0,
                 fade_out_frames: 0,
+                fade_curve: FadeCurve::Linear,
                 source: ClipSource::Midi {
                     notes: take
                         .notes
@@ -2907,12 +3670,375 @@ impl DmoApp {
         }
     }
 
+    fn set_cycle_range(&mut self, start_frame: u64, end_frame: u64) {
+        let Some(cycle_range) = CycleRange::new(start_frame, end_frame) else {
+            self.status_error("Loop range must be at least one frame");
+            return;
+        };
+        self.loop_start_frame = cycle_range.start_frame;
+        self.loop_end_frame = cycle_range.end_frame;
+        self.loop_enabled = true;
+        self.apply_edit(EditCommand::SetCycleRange {
+            cycle_range: Some(cycle_range),
+        });
+        self.sync_playback_loop();
+    }
+
+    fn write_cycle_range_from_transport(&mut self) {
+        let cycle_range = self
+            .loop_enabled
+            .then(|| CycleRange::new(self.loop_start_frame, self.loop_end_frame))
+            .flatten();
+        self.apply_edit(EditCommand::SetCycleRange { cycle_range });
+    }
+
+    fn add_marker_at_playhead(&mut self) {
+        let marker_number = self.project.markers.len() + 1;
+        let marker = Marker::new(format!("Marker {marker_number}"), self.playhead_frame);
+        let index = marker_insert_index(&self.project.markers, marker.frame);
+        self.apply_edit(EditCommand::AddMarker { index, marker });
+        self.status_ok("Marker added");
+    }
+
+    fn seek_previous_marker(&mut self) {
+        let Some(marker) = self
+            .project
+            .markers
+            .iter()
+            .filter(|marker| marker.frame < self.playhead_frame)
+            .max_by_key(|marker| marker.frame)
+            .cloned()
+        else {
+            self.status_error("No previous marker");
+            return;
+        };
+        self.seek(marker.frame);
+        self.status_ok(format!("Marker: {}", marker.name));
+    }
+
+    fn seek_next_marker(&mut self) {
+        let Some(marker) = self
+            .project
+            .markers
+            .iter()
+            .filter(|marker| marker.frame > self.playhead_frame)
+            .min_by_key(|marker| marker.frame)
+            .cloned()
+        else {
+            self.status_error("No next marker");
+            return;
+        };
+        self.seek(marker.frame);
+        self.status_ok(format!("Marker: {}", marker.name));
+    }
+
+    fn add_arranger_section_at_playhead(&mut self) {
+        let section_number = self.project.arranger_sections.len() + 1;
+        let length_frames = bars_to_frames(
+            4,
+            self.project.sample_rate,
+            self.project.tempo_bpm,
+            self.project.time_signature,
+        )
+        .max(grid_note_frames(
+            self.project.sample_rate,
+            self.project.tempo_bpm,
+            SnapGrid::Quarter,
+        ));
+        let mut section = ArrangerSection::new(
+            format!("Section {section_number}"),
+            self.playhead_frame,
+            length_frames,
+        );
+        section.color_index = u8::try_from(section_number % ARRANGER_COLORS.len()).unwrap_or(0);
+        let index = arranger_insert_index(&self.project.arranger_sections, section.start_frame);
+        self.apply_edit(EditCommand::AddArrangerSection { index, section });
+        self.status_ok("Arranger section added");
+    }
+
+    fn arranger_inspector(&mut self, ui: &mut egui::Ui) {
+        ui.collapsing("Arranger", |ui| {
+            ui.horizontal(|ui| {
+                if ui.button("+ Section").clicked() {
+                    self.add_arranger_section_at_playhead();
+                }
+                ui.small(format!(
+                    "{} section(s)",
+                    self.project.arranger_sections.len()
+                ));
+            });
+            let mut delete_section = None;
+            let mut seek_section = None;
+            for section_index in 0..self.project.arranger_sections.len() {
+                let original = self.project.arranger_sections[section_index].clone();
+                let mut edited = original.clone();
+                ui.group(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.text_edit_singleline(&mut edited.name);
+                        if ui.small_button("Go").clicked() {
+                            seek_section = Some(edited.start_frame);
+                        }
+                        if ui
+                            .small_button("×")
+                            .on_hover_text("Delete arranger section")
+                            .clicked()
+                        {
+                            delete_section = Some(section_index);
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Start");
+                        let mut start_seconds =
+                            frames_to_seconds(edited.start_frame, self.project.sample_rate);
+                        if ui
+                            .add(
+                                egui::DragValue::new(&mut start_seconds)
+                                    .range(0.0..=3_600.0)
+                                    .speed(0.01)
+                                    .fixed_decimals(3)
+                                    .suffix(" s"),
+                            )
+                            .changed()
+                        {
+                            edited.start_frame = self.project.seconds_to_frames(start_seconds);
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Length");
+                        let mut length_seconds =
+                            frames_to_seconds(edited.length_frames, self.project.sample_rate);
+                        if ui
+                            .add(
+                                egui::DragValue::new(&mut length_seconds)
+                                    .range(0.001..=3_600.0)
+                                    .speed(0.01)
+                                    .fixed_decimals(3)
+                                    .suffix(" s"),
+                            )
+                            .changed()
+                        {
+                            edited.length_frames =
+                                self.project.seconds_to_frames(length_seconds).max(1);
+                        }
+                        color_swatch(ui, arranger_color(edited.color_index));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Color");
+                        egui::ComboBox::from_id_salt(("arranger_color", section_index))
+                            .width(72.0)
+                            .selected_text(format!("{}", edited.color_index))
+                            .show_ui(ui, |ui| {
+                                for index in 0..ARRANGER_COLORS.len() {
+                                    ui.selectable_value(
+                                        &mut edited.color_index,
+                                        u8::try_from(index).unwrap_or(0),
+                                        format!("Color {index}"),
+                                    );
+                                }
+                            });
+                    });
+                });
+                if edited != original {
+                    self.apply_edit(EditCommand::ReplaceArrangerSection {
+                        index: section_index,
+                        section: edited,
+                    });
+                }
+            }
+            if let Some(index) = delete_section {
+                self.apply_edit(EditCommand::DeleteArrangerSection { index });
+            }
+            if let Some(frame) = seek_section {
+                self.seek(frame);
+            }
+        });
+    }
+
+    fn marker_inspector(&mut self, ui: &mut egui::Ui) {
+        ui.collapsing("Markers", |ui| {
+            ui.horizontal(|ui| {
+                if ui.button("+ Marker").clicked() {
+                    self.add_marker_at_playhead();
+                }
+                ui.small(format!("{} marker(s)", self.project.markers.len()));
+            });
+            let mut delete_marker = None;
+            let mut seek_marker = None;
+            for marker_index in 0..self.project.markers.len() {
+                let original = self.project.markers[marker_index].clone();
+                let mut edited = original.clone();
+                ui.group(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.text_edit_singleline(&mut edited.name);
+                        if ui.small_button("Go").clicked() {
+                            seek_marker = Some(edited.frame);
+                        }
+                        if ui
+                            .small_button("×")
+                            .on_hover_text("Delete marker")
+                            .clicked()
+                        {
+                            delete_marker = Some(marker_index);
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Position");
+                        let mut seconds = frames_to_seconds(edited.frame, self.project.sample_rate);
+                        if ui
+                            .add(
+                                egui::DragValue::new(&mut seconds)
+                                    .range(0.0..=3_600.0)
+                                    .speed(0.01)
+                                    .fixed_decimals(3)
+                                    .suffix(" s"),
+                            )
+                            .changed()
+                        {
+                            edited.frame = self.project.seconds_to_frames(seconds);
+                        }
+                        ui.small(format_musical_position(
+                            edited.frame,
+                            self.project.sample_rate,
+                            self.project.tempo_bpm,
+                            self.project.time_signature,
+                        ));
+                    });
+                });
+                if edited != original {
+                    self.apply_edit(EditCommand::ReplaceMarker {
+                        index: marker_index,
+                        marker: edited,
+                    });
+                }
+            }
+            if let Some(index) = delete_marker {
+                self.apply_edit(EditCommand::DeleteMarker { index });
+            }
+            if let Some(frame) = seek_marker {
+                self.seek(frame);
+            }
+        });
+    }
+
+    fn mixer_inspector(&mut self, ui: &mut egui::Ui) {
+        ui.collapsing("Mixer", |ui| {
+            let mut master_inserts = self.project.master_inserts.clone();
+            ui.label("Master inserts");
+            insert_chain_editor(ui, "master_inserts", &mut master_inserts);
+            if master_inserts != self.project.master_inserts {
+                self.apply_edit(EditCommand::SetMasterInserts {
+                    inserts: master_inserts,
+                });
+            }
+
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.strong("Buses");
+                if ui.button("+ Bus").clicked() {
+                    let index = self.project.buses.len();
+                    self.apply_edit(EditCommand::AddBus {
+                        index,
+                        bus: Bus::new(format!("Bus {}", index + 1)),
+                    });
+                }
+            });
+
+            let mut delete_bus = None;
+            for bus_index in 0..self.project.buses.len() {
+                let original = self.project.buses[bus_index].clone();
+                let mut edited = original.clone();
+                ui.group(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.text_edit_singleline(&mut edited.name);
+                        if ui.small_button("×").on_hover_text("Delete bus").clicked() {
+                            delete_bus = Some(bus_index);
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.toggle_value(&mut edited.muted, "M");
+                        ui.toggle_value(&mut edited.soloed, "S");
+                        ui.label("Gain");
+                        ui.add_sized(
+                            [82.0, 18.0],
+                            egui::Slider::new(&mut edited.gain, 0.0..=1.5).show_value(false),
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Pan");
+                        ui.add_sized(
+                            [128.0, 18.0],
+                            egui::Slider::new(&mut edited.pan, -1.0..=1.0).show_value(false),
+                        );
+                    });
+                    insert_chain_editor(ui, ("bus_inserts", bus_index), &mut edited.inserts);
+                });
+                if edited != original {
+                    self.apply_edit(EditCommand::ReplaceBus {
+                        index: bus_index,
+                        bus: edited,
+                    });
+                }
+            }
+            if let Some(index) = delete_bus {
+                self.apply_edit(EditCommand::DeleteBus { index });
+            }
+        });
+    }
+
     fn add_tone_clip(&mut self) {
         let Some(track_index) = self.selected_track else {
             self.status_error("Select a track before adding a clip");
             return;
         };
         self.add_grid_note(track_index, self.playhead_frame, 69);
+    }
+
+    fn capture_retrospective_midi(&mut self) {
+        let now = Instant::now();
+        prune_retrospective_midi(
+            &mut self.retrospective_midi,
+            now,
+            Duration::from_secs(RETROSPECTIVE_MIDI_SECONDS),
+        );
+        let Some(mut clip) = retrospective_midi_clip(
+            &self.retrospective_midi,
+            now,
+            Duration::from_secs(RETROSPECTIVE_MIDI_SECONDS),
+            self.project.sample_rate,
+        ) else {
+            self.status_error("No complete recent MIDI notes to capture");
+            return;
+        };
+        let track_index = self
+            .selected_track
+            .filter(|index| *index < self.project.tracks.len())
+            .unwrap_or_else(|| {
+                let index = self.project.tracks.len();
+                let mut track = Track::new(format!("MIDI Track {}", index + 1));
+                track.input = TrackInput::MidiOmni;
+                self.apply_edit(EditCommand::AddTrack { index, track });
+                self.selected_track = Some(index);
+                index
+            });
+        clip.start_frame = snap_frame(
+            self.playhead_frame.saturating_sub(clip.length_frames),
+            self.project.sample_rate,
+            self.project.tempo_bpm,
+            self.arrange.snap_enabled,
+            self.arrange.snap_grid,
+        );
+        let clip_index = self.project.tracks[track_index].clips.len();
+        self.apply_edit(EditCommand::AddClip {
+            track_index,
+            clip_index,
+            clip,
+        });
+        self.selected_track = Some(track_index);
+        self.selected_clip = Some((track_index, clip_index));
+        self.selected_note = first_note_selection(&self.project, self.selected_clip);
+        self.piano_roll.open = true;
+        self.piano_roll.scroll_to_selection = true;
+        self.status_ok("Captured retrospective MIDI");
     }
 
     fn import_wav_dialog(&mut self) {
@@ -2975,10 +4101,10 @@ impl DmoApp {
             gain: 1.0,
             fade_in_frames: 0,
             fade_out_frames: 0,
+            fade_curve: FadeCurve::Linear,
             source: imported.source,
         };
-        self.waveforms
-            .insert(stored_path.clone(), imported.overview);
+        self.cache_waveform(&stored_path, &path, imported.overview);
         self.waveform_errors.remove(&stored_path);
         self.apply_edit(EditCommand::AddClip {
             track_index,
@@ -2988,6 +4114,162 @@ impl DmoApp {
         self.selected_track = Some(track_index);
         self.selected_clip = Some((track_index, clip_index));
         self.status_ok(format!("Imported {}", path.display()));
+    }
+
+    fn import_soundfont_for_track(&mut self, track_index: usize) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("SoundFont", &["sf2"])
+            .set_title("Load SoundFont instrument")
+            .pick_file()
+        else {
+            return;
+        };
+        let info = match inspect_soundfont(&path) {
+            Ok(info) => info,
+            Err(error) => {
+                self.status_error(error);
+                return;
+            }
+        };
+        let Some(first_preset) = info.presets.first().cloned() else {
+            self.status_error("SoundFont has no selectable presets");
+            return;
+        };
+        let count = info.presets.len();
+        self.soundfont_presets
+            .insert(first_preset.path.clone(), info.presets);
+        let Some(track) = self.project.tracks.get(track_index).cloned() else {
+            return;
+        };
+        let mut edited = track;
+        edited.soundfont = Some(first_preset.clone());
+        self.apply_edit(EditCommand::ReplaceTrack {
+            track_index,
+            track: edited,
+        });
+        self.status_ok(format!(
+            "Loaded {count} SoundFont preset(s): {}",
+            first_preset.name
+        ));
+    }
+
+    fn relink_selected_audio_clip(&mut self) {
+        let Some((track_index, clip_index)) = self.selected_clip else {
+            self.status_error("Select an audio clip before relinking");
+            return;
+        };
+        let Some(current_clip) = self
+            .project
+            .tracks
+            .get(track_index)
+            .and_then(|track| track.clips.get(clip_index))
+            .cloned()
+        else {
+            self.status_error("Selected clip no longer exists");
+            return;
+        };
+        if !matches!(current_clip.source, ClipSource::AudioFile { .. }) {
+            self.status_error("Relink is only available for imported audio clips");
+            return;
+        }
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("WAV audio", &["wav", "wave"])
+            .set_title("Relink WAV audio")
+            .pick_file()
+        else {
+            return;
+        };
+
+        let imported = match import_wav_with_overview(&path, WAVEFORM_PEAKS) {
+            Ok(imported) => imported,
+            Err(error) => {
+                self.status_error(error);
+                return;
+            }
+        };
+        let stored_path = match &imported.source {
+            ClipSource::AudioFile { path, .. } => path.clone(),
+            ClipSource::Midi { .. } | ClipSource::Sine { .. } => {
+                unreachable!("WAV import always creates an audio source")
+            }
+        };
+        let old_offset = match current_clip.source {
+            ClipSource::AudioFile {
+                source_offset_frames,
+                ..
+            } => source_offset_frames,
+            ClipSource::Midi { .. } | ClipSource::Sine { .. } => 0,
+        };
+        let new_offset = old_offset.min(imported.info.frames.saturating_sub(1));
+        let mut relinked = current_clip;
+        relinked.source = ClipSource::AudioFile {
+            path: stored_path.clone(),
+            source_offset_frames: new_offset,
+            source_sample_rate: imported.info.sample_rate,
+            channels: imported.info.channels,
+            reversed: false,
+        };
+        self.cache_waveform(&stored_path, &path, imported.overview);
+        self.apply_edit(EditCommand::ReplaceClip {
+            track_index,
+            clip_index,
+            clip: relinked,
+        });
+        self.refresh_waveforms();
+        self.status_ok(format!("Relinked WAV {}", path.display()));
+    }
+
+    fn normalize_selected_audio_clip(&mut self) {
+        let Some((track_index, clip_index)) = self.selected_clip else {
+            self.status_error("Select an audio clip before normalizing");
+            return;
+        };
+        let Some(clip) = self
+            .project
+            .tracks
+            .get(track_index)
+            .and_then(|track| track.clips.get(clip_index))
+            .cloned()
+        else {
+            self.status_error("Selected clip no longer exists");
+            return;
+        };
+        let ClipSource::AudioFile {
+            path,
+            source_offset_frames,
+            source_sample_rate,
+            ..
+        } = &clip.source
+        else {
+            self.status_error("Normalize is only available for imported audio clips");
+            return;
+        };
+        let resolved = self.resolve_audio_path(path);
+        let decoded = match decode_wav(&resolved) {
+            Ok(decoded) => decoded,
+            Err(error) => {
+                self.status_error(error);
+                return;
+            }
+        };
+        let Some(gain) = normalized_clip_gain(
+            &decoded.samples,
+            *source_offset_frames,
+            clip.length_frames,
+            self.project.sample_rate,
+            *source_sample_rate,
+        ) else {
+            self.status_error("Selected audio range is silent");
+            return;
+        };
+        let mut normalized = clip;
+        normalized.gain = gain;
+        self.apply_edit(EditCommand::ReplaceClip {
+            track_index,
+            clip_index,
+            clip: normalized,
+        });
+        self.status_ok(format!("Normalized clip gain to {}", format_gain_db(gain)));
     }
 
     #[allow(clippy::too_many_lines)]
@@ -3060,6 +4342,14 @@ impl DmoApp {
                     ..point
                 })
                 .collect();
+            track.midi_program_changes = imported_track
+                .program_changes
+                .into_iter()
+                .map(|point| MidiProgramChangePoint {
+                    frame: insertion_frame.saturating_add(point.frame),
+                    ..point
+                })
+                .collect();
             if !imported_track.notes.is_empty() {
                 let length_frames = imported_track
                     .notes
@@ -3075,6 +4365,7 @@ impl DmoApp {
                     gain: 1.0,
                     fade_in_frames: 0,
                     fade_out_frames: 0,
+                    fade_curve: FadeCurve::Linear,
                     source: ClipSource::Midi {
                         notes: imported_track.notes,
                         amplitude: 0.8,
@@ -3123,7 +4414,6 @@ impl DmoApp {
             Ok(()) => {
                 self.dirty = true;
                 self.invalidate_playback();
-                self.loop_end_frame = self.project.duration_frames().max(1);
                 self.status_ok("Project edited");
             }
             Err(error) => self.status_error(error),
@@ -3187,7 +4477,8 @@ impl DmoApp {
                 MidiPlaybackEvent::Control { .. }
                 | MidiPlaybackEvent::PitchBend { .. }
                 | MidiPlaybackEvent::ChannelPressure { .. }
-                | MidiPlaybackEvent::PolyPressure { .. } => {}
+                | MidiPlaybackEvent::PolyPressure { .. }
+                | MidiPlaybackEvent::ProgramChange { .. } => {}
             }
         }
         Ok(())
@@ -3224,7 +4515,9 @@ impl DmoApp {
             UiAction::Open => self.open_project_dialog(),
             UiAction::Save => self.save(),
             UiAction::SaveAs => self.save_as_dialog(),
-            UiAction::Export => self.export_dialog(),
+            UiAction::ExportMixdown(format) => self.export_dialog(format),
+            UiAction::ExportStems => self.export_stems_dialog(),
+            UiAction::ConsolidateProject => self.consolidate_project_dialog(),
             UiAction::ImportWav => self.import_wav_dialog(),
             UiAction::ImportMidi => self.import_midi_dialog(),
             UiAction::ExportMidi => self.export_midi_dialog(),
@@ -3242,6 +4535,7 @@ impl DmoApp {
             .unwrap_or_else(|_| demo_project(sample_rate));
         project.tracks.push(Track::new("Track 1"));
         self.replace_project(project, None, false);
+        self.view = AppView::Editor;
         self.status_ok("Created a new project");
     }
 
@@ -3259,6 +4553,7 @@ impl DmoApp {
         match load_project(&path) {
             Ok(project) => {
                 self.replace_project(project, Some(path.clone()), false);
+                self.view = AppView::Editor;
                 self.status_ok(format!("Opened {}", path.display()));
             }
             Err(error) => self.status_error(error),
@@ -3302,7 +4597,7 @@ impl DmoApp {
         }
     }
 
-    fn export_dialog(&mut self) {
+    fn export_dialog(&mut self, format: ExportAudioFormat) {
         let suggested = self
             .project_path
             .as_deref()
@@ -3312,7 +4607,7 @@ impl DmoApp {
         let Some(path) = rfd::FileDialog::new()
             .add_filter("WAV audio", &["wav"])
             .set_file_name(suggested)
-            .set_title("Export stereo WAV")
+            .set_title(format!("Export stereo {}", format.label()))
             .save_file()
         else {
             return;
@@ -3325,8 +4620,106 @@ impl DmoApp {
                 return;
             }
         };
-        match write_stereo_i16_wav(&path, self.project.sample_rate, &samples) {
+        let result = match format {
+            ExportAudioFormat::Wav16 => {
+                write_stereo_i16_wav(&path, self.project.sample_rate, &samples)
+            }
+            ExportAudioFormat::Wav24 => {
+                write_stereo_i24_wav(&path, self.project.sample_rate, &samples)
+            }
+            ExportAudioFormat::WavFloat32 => {
+                write_stereo_f32_wav(&path, self.project.sample_rate, &samples)
+            }
+        };
+        match result {
             Ok(()) => self.status_ok(format!("Exported {}", path.display())),
+            Err(error) => self.status_error(error),
+        }
+    }
+
+    fn export_stems_dialog(&mut self) {
+        let Some(output_dir) = rfd::FileDialog::new()
+            .set_title("Export track stems")
+            .pick_folder()
+        else {
+            return;
+        };
+        let stems = match try_render_track_stems(&self.project) {
+            Ok(stems) => stems,
+            Err(error) => {
+                self.status_error(error);
+                return;
+            }
+        };
+        if stems.is_empty() {
+            self.status_error("No unmuted tracks to export");
+            return;
+        }
+        if let Err(error) = fs::create_dir_all(&output_dir) {
+            self.status_error(format!(
+                "Could not create {}: {error}",
+                output_dir.display()
+            ));
+            return;
+        }
+        for stem in &stems {
+            let path = output_dir.join(format!(
+                "{:02}_{}.wav",
+                stem.track_index + 1,
+                sanitize_file_component(&stem.track_name)
+            ));
+            if let Err(error) = write_stereo_i16_wav(&path, self.project.sample_rate, &stem.samples)
+            {
+                self.status_error(format!("Could not export {}: {error}", path.display()));
+                return;
+            }
+        }
+        self.status_ok(format!(
+            "Exported {} stem(s) to {}",
+            stems.len(),
+            output_dir.display()
+        ));
+    }
+
+    fn consolidate_project_dialog(&mut self) {
+        let Some(output_dir) = rfd::FileDialog::new()
+            .set_title("Consolidate project")
+            .pick_folder()
+        else {
+            return;
+        };
+        let media_dir = output_dir.join("Media");
+        let consolidated = match consolidate_project_media(
+            &self.project,
+            self.project_path.as_deref(),
+            &media_dir,
+        ) {
+            Ok(consolidated) => consolidated,
+            Err(error) => {
+                self.status_error(error);
+                return;
+            }
+        };
+        let project_name = self
+            .project_path
+            .as_deref()
+            .and_then(Path::file_name)
+            .and_then(|name| name.to_str())
+            .map_or_else(
+                || format!("{}.dmo", sanitize_file_component(&self.project.name)),
+                ToOwned::to_owned,
+            );
+        let output_project = with_extension_if_missing(output_dir.join(project_name), "dmo");
+        match save_project(&output_project, &consolidated.project) {
+            Ok(()) => {
+                let copied_files = consolidated.copied_files;
+                self.replace_project(consolidated.project, Some(output_project.clone()), false);
+                self.status_ok(format!(
+                    "Consolidated {} media file(s) to {}",
+                    copied_files,
+                    output_project.display()
+                ));
+            }
             Err(error) => self.status_error(error),
         }
     }
@@ -3373,9 +4766,7 @@ impl DmoApp {
             .map(|(track_index, _)| track_index)
             .or_else(|| (!self.project.tracks.is_empty()).then_some(0));
         self.playhead_frame = 0;
-        self.loop_start_frame = 0;
-        self.loop_end_frame = self.project.duration_frames().max(1);
-        self.loop_enabled = false;
+        self.sync_cycle_controls_from_project();
         self.recording_options.punch_enabled = false;
         self.dirty = dirty;
         self.piano_roll.scroll_to_selection = true;
@@ -3404,14 +4795,24 @@ impl DmoApp {
                         ClipSource::Sine { .. } | ClipSource::AudioFile { .. } => false,
                     })
             });
-        self.loop_end_frame = self.project.duration_frames().max(1);
+        self.sync_cycle_controls_from_project();
         self.playhead_frame = self.playhead_frame.min(self.loop_end_frame);
         self.sync_playback_loop();
     }
 
+    fn sync_cycle_controls_from_project(&mut self) {
+        if let Some(range) = self.project.cycle_range {
+            self.loop_start_frame = range.start_frame;
+            self.loop_end_frame = range.end_frame;
+            self.loop_enabled = true;
+        } else {
+            self.loop_start_frame = 0;
+            self.loop_end_frame = self.project.duration_frames().max(1);
+            self.loop_enabled = false;
+        }
+    }
+
     fn refresh_waveforms(&mut self) {
-        self.waveforms.clear();
-        self.waveform_errors.clear();
         let mut sources = self
             .project
             .tracks
@@ -3429,23 +4830,73 @@ impl DmoApp {
                 .flat_map(|track| &track.take_lanes)
                 .map(|take| take.path.clone()),
         );
+        sources.sort();
+        sources.dedup();
+        let active_sources = sources.iter().cloned().collect::<HashSet<_>>();
+        self.waveforms
+            .retain(|stored_path, _| active_sources.contains(stored_path));
+        self.waveform_errors
+            .retain(|stored_path, _| active_sources.contains(stored_path));
+        self.waveform_fingerprints
+            .retain(|stored_path, _| active_sources.contains(stored_path));
 
         for stored_path in sources {
-            if self.waveforms.contains_key(&stored_path)
-                || self.waveform_errors.contains_key(&stored_path)
+            let resolved = self.resolve_audio_path(&stored_path);
+            let fingerprint = audio_file_fingerprint(&resolved).ok();
+            if self.waveform_fingerprints.get(&stored_path) == fingerprint.as_ref()
+                && (self.waveforms.contains_key(&stored_path)
+                    || self.waveform_errors.contains_key(&stored_path))
             {
                 continue;
             }
-            let resolved = self.resolve_audio_path(&stored_path);
+            self.waveforms.remove(&stored_path);
+            self.waveform_errors.remove(&stored_path);
+            self.waveform_fingerprints.remove(&stored_path);
             match decode_wav_overview(&resolved, WAVEFORM_PEAKS) {
                 Ok(overview) => {
-                    self.waveforms.insert(stored_path, overview);
+                    let fingerprint = fingerprint
+                        .or_else(|| audio_file_fingerprint(&resolved).ok())
+                        .unwrap_or(AudioFileFingerprint {
+                            len: 0,
+                            modified: None,
+                        });
+                    self.waveforms
+                        .insert(stored_path.clone(), CachedWaveform { overview });
+                    self.waveform_fingerprints.insert(stored_path, fingerprint);
                 }
                 Err(error) => {
+                    if let Some(fingerprint) = fingerprint {
+                        self.waveform_fingerprints
+                            .insert(stored_path.clone(), fingerprint);
+                    }
                     self.waveform_errors.insert(stored_path, error.to_string());
                 }
             }
         }
+    }
+
+    fn waveform_overviews(&self) -> HashMap<String, WaveformOverview> {
+        self.waveforms
+            .iter()
+            .map(|(path, cached)| (path.clone(), cached.overview.clone()))
+            .collect()
+    }
+
+    fn cache_waveform(
+        &mut self,
+        stored_path: &str,
+        resolved_path: &Path,
+        overview: WaveformOverview,
+    ) {
+        let fingerprint = audio_file_fingerprint(resolved_path).unwrap_or(AudioFileFingerprint {
+            len: 0,
+            modified: None,
+        });
+        self.waveforms
+            .insert(stored_path.to_owned(), CachedWaveform { overview });
+        self.waveform_fingerprints
+            .insert(stored_path.to_owned(), fingerprint);
+        self.waveform_errors.remove(stored_path);
     }
 
     fn resolve_audio_path(&self, stored_path: &str) -> PathBuf {
@@ -3571,6 +5022,7 @@ fn split_clip_at_frame(
             source_offset_frames,
             source_sample_rate,
             channels,
+            reversed,
         } => {
             right.source = ClipSource::AudioFile {
                 path: path.clone(),
@@ -3581,11 +5033,32 @@ fn split_clip_at_frame(
                 )),
                 source_sample_rate: *source_sample_rate,
                 channels: *channels,
+                reversed: *reversed,
             };
         }
         ClipSource::Sine { .. } => {}
     }
     Some((left, right))
+}
+
+fn slipped_source_offset(
+    current_offset: u64,
+    delta_project_frames: i64,
+    project_sample_rate: u32,
+    source_sample_rate: u32,
+    source_frames: Option<u64>,
+) -> u64 {
+    let magnitude = rescale_frames_round(
+        delta_project_frames.unsigned_abs(),
+        project_sample_rate,
+        source_sample_rate,
+    );
+    let slipped = if delta_project_frames.is_negative() {
+        current_offset.saturating_sub(magnitude)
+    } else {
+        current_offset.saturating_add(magnitude)
+    };
+    source_frames.map_or(slipped, |frames| slipped.min(frames.saturating_sub(1)))
 }
 
 fn metronome_preview_frames(sample_rate: u32, tempo_bpm: f64, beats: u64) -> usize {
@@ -3681,15 +5154,19 @@ fn clip_trim_command(
 
 impl eframe::App for DmoApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        self.update_playback(ui);
-        self.update_live_midi(ui);
-        self.update_recording(ui);
-        self.keyboard_shortcuts(ui);
         let marker = if self.dirty { "*" } else { "" };
         ui.send_viewport_cmd(egui::ViewportCommand::Title(format!(
             "DMO — {}{marker}",
             self.project.name
         )));
+        if self.view == AppView::Start {
+            self.start_screen(ui);
+            return;
+        }
+        self.update_playback(ui);
+        self.update_live_midi(ui);
+        self.update_recording(ui);
+        self.keyboard_shortcuts(ui);
 
         egui::Panel::top("menu_bar").show(ui, |ui| self.menu_bar(ui));
         egui::Panel::top("arrange_toolbar")
@@ -3751,6 +5228,451 @@ fn menu_action(ui: &mut egui::Ui, label: &str, action: &mut Option<UiAction>, va
     }
 }
 
+fn track_routing_editor(
+    ui: &mut egui::Ui,
+    id: impl std::hash::Hash + std::fmt::Debug,
+    track: &mut Track,
+    buses: &[Bus],
+) {
+    ui.horizontal(|ui| {
+        ui.label("Output");
+        egui::ComboBox::from_id_salt(("track_output", &id))
+            .selected_text(channel_output_label(track.output, buses))
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut track.output, ChannelOutput::Master, "Master");
+                for (index, bus) in buses.iter().enumerate() {
+                    ui.selectable_value(
+                        &mut track.output,
+                        ChannelOutput::Bus(index),
+                        bus.name.as_str(),
+                    );
+                }
+            });
+    });
+
+    ui.horizontal(|ui| {
+        ui.label("Sends");
+        if ui
+            .add_enabled(!buses.is_empty(), egui::Button::new("+ Send"))
+            .clicked()
+        {
+            track.sends.push(TrackSend::new(0));
+        }
+    });
+    if buses.is_empty() {
+        ui.small("Add a bus before creating sends");
+    }
+
+    let mut remove_send = None;
+    for send_index in 0..track.sends.len() {
+        ui.horizontal(|ui| {
+            let send = &mut track.sends[send_index];
+            ui.checkbox(&mut send.enabled, "");
+            egui::ComboBox::from_id_salt(("send_bus", &id, send_index))
+                .width(86.0)
+                .selected_text(
+                    buses
+                        .get(send.bus_index)
+                        .map_or("Missing bus", |bus| bus.name.as_str()),
+                )
+                .show_ui(ui, |ui| {
+                    for (bus_index, bus) in buses.iter().enumerate() {
+                        ui.selectable_value(&mut send.bus_index, bus_index, bus.name.as_str());
+                    }
+                });
+            ui.toggle_value(&mut send.pre_fader, "Pre");
+            ui.add_sized(
+                [62.0, 18.0],
+                egui::Slider::new(&mut send.gain, 0.0..=1.5).show_value(false),
+            );
+            if ui.small_button("×").on_hover_text("Delete send").clicked() {
+                remove_send = Some(send_index);
+            }
+        });
+    }
+    if let Some(index) = remove_send {
+        track.sends.remove(index);
+    }
+}
+
+fn channel_output_label(output: ChannelOutput, buses: &[Bus]) -> String {
+    match output {
+        ChannelOutput::Master => "Master".into(),
+        ChannelOutput::Bus(index) => buses
+            .get(index)
+            .map_or_else(|| format!("Missing bus {index}"), |bus| bus.name.clone()),
+    }
+}
+
+fn insert_chain_editor(
+    ui: &mut egui::Ui,
+    id: impl std::hash::Hash + std::fmt::Debug,
+    inserts: &mut Vec<ChannelInsert>,
+) {
+    ui.horizontal(|ui| {
+        ui.label("Inserts");
+        if ui.button("+").on_hover_text("Add insert").clicked() {
+            inserts.push(ChannelInsert::new(InsertEffect::Gain { gain_db: 0.0 }));
+        }
+        egui::ComboBox::from_id_salt(("insert_preset", &id))
+            .width(116.0)
+            .selected_text("Preset")
+            .show_ui(ui, |ui| {
+                for preset in ChannelStripPreset::ALL {
+                    if ui.button(preset.label()).clicked() {
+                        *inserts = preset.inserts();
+                        ui.close();
+                    }
+                }
+            });
+    });
+    let mut remove_insert = None;
+    for (index, insert) in inserts.iter_mut().enumerate() {
+        ui.group(|ui| {
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut insert.enabled, "");
+                let mut selected = insert.effect;
+                egui::ComboBox::from_id_salt(("insert_effect", &id, index))
+                    .width(122.0)
+                    .selected_text(selected.label())
+                    .show_ui(ui, |ui| {
+                        for effect in InsertEffect::ALL_DEFAULTS {
+                            ui.selectable_value(&mut selected, effect, effect.label());
+                        }
+                    });
+                if selected.label() != insert.effect.label() {
+                    insert.effect = selected;
+                }
+                if ui
+                    .small_button("×")
+                    .on_hover_text("Delete insert")
+                    .clicked()
+                {
+                    remove_insert = Some(index);
+                }
+            });
+            insert_effect_editor(ui, &mut insert.effect);
+        });
+    }
+    if let Some(index) = remove_insert {
+        inserts.remove(index);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChannelStripPreset {
+    CleanVocal,
+    TightBass,
+    DrumPunch,
+    MasterGlue,
+    LoFiColor,
+}
+
+impl ChannelStripPreset {
+    const ALL: [Self; 5] = [
+        Self::CleanVocal,
+        Self::TightBass,
+        Self::DrumPunch,
+        Self::MasterGlue,
+        Self::LoFiColor,
+    ];
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::CleanVocal => "Clean Vocal",
+            Self::TightBass => "Tight Bass",
+            Self::DrumPunch => "Drum Punch",
+            Self::MasterGlue => "Master Glue",
+            Self::LoFiColor => "Lo-fi Color",
+        }
+    }
+
+    fn inserts(self) -> Vec<ChannelInsert> {
+        match self {
+            Self::CleanVocal => vec![
+                ChannelInsert::new(InsertEffect::ThreeBandEq {
+                    low_db: -2.0,
+                    mid_db: 1.5,
+                    high_db: 3.0,
+                }),
+                ChannelInsert::new(InsertEffect::Compressor {
+                    threshold_db: -20.0,
+                    ratio: 3.0,
+                    attack_ms: 8.0,
+                    release_ms: 120.0,
+                    makeup_db: 2.0,
+                }),
+            ],
+            Self::TightBass => vec![
+                ChannelInsert::new(InsertEffect::ThreeBandEq {
+                    low_db: 3.0,
+                    mid_db: -2.5,
+                    high_db: -1.0,
+                }),
+                ChannelInsert::new(InsertEffect::Compressor {
+                    threshold_db: -24.0,
+                    ratio: 5.0,
+                    attack_ms: 18.0,
+                    release_ms: 160.0,
+                    makeup_db: 3.0,
+                }),
+                ChannelInsert::new(InsertEffect::Saturation {
+                    drive: 1.4,
+                    mix: 0.35,
+                }),
+            ],
+            Self::DrumPunch => vec![
+                ChannelInsert::new(InsertEffect::Compressor {
+                    threshold_db: -18.0,
+                    ratio: 6.0,
+                    attack_ms: 28.0,
+                    release_ms: 80.0,
+                    makeup_db: 4.0,
+                }),
+                ChannelInsert::new(InsertEffect::ThreeBandEq {
+                    low_db: 2.0,
+                    mid_db: -1.0,
+                    high_db: 2.5,
+                }),
+            ],
+            Self::MasterGlue => vec![
+                ChannelInsert::new(InsertEffect::Compressor {
+                    threshold_db: -12.0,
+                    ratio: 2.0,
+                    attack_ms: 30.0,
+                    release_ms: 220.0,
+                    makeup_db: 1.0,
+                }),
+                ChannelInsert::new(InsertEffect::Gain { gain_db: -1.0 }),
+            ],
+            Self::LoFiColor => vec![
+                ChannelInsert::new(InsertEffect::ThreeBandEq {
+                    low_db: -1.0,
+                    mid_db: 2.0,
+                    high_db: -4.0,
+                }),
+                ChannelInsert::new(InsertEffect::Saturation {
+                    drive: 3.0,
+                    mix: 0.65,
+                }),
+                ChannelInsert::new(InsertEffect::Gain { gain_db: -2.0 }),
+            ],
+        }
+    }
+}
+
+fn insert_effect_editor(ui: &mut egui::Ui, effect: &mut InsertEffect) {
+    match effect {
+        InsertEffect::Gain { gain_db } => {
+            ui.add(egui::Slider::new(gain_db, -24.0..=24.0).text("Gain dB"));
+        }
+        InsertEffect::ThreeBandEq {
+            low_db,
+            mid_db,
+            high_db,
+        } => {
+            ui.add(egui::Slider::new(low_db, -18.0..=18.0).text("Low"));
+            ui.add(egui::Slider::new(mid_db, -18.0..=18.0).text("Mid"));
+            ui.add(egui::Slider::new(high_db, -18.0..=18.0).text("High"));
+        }
+        InsertEffect::Compressor {
+            threshold_db,
+            ratio,
+            attack_ms,
+            release_ms,
+            makeup_db,
+        } => {
+            ui.add(egui::Slider::new(threshold_db, -60.0..=0.0).text("Threshold"));
+            ui.add(egui::Slider::new(ratio, 1.0..=20.0).text("Ratio"));
+            ui.add(egui::Slider::new(attack_ms, 0.1..=100.0).text("Attack ms"));
+            ui.add(egui::Slider::new(release_ms, 5.0..=1_000.0).text("Release ms"));
+            ui.add(egui::Slider::new(makeup_db, -12.0..=24.0).text("Makeup"));
+        }
+        InsertEffect::Saturation { drive, mix } => {
+            ui.add(egui::Slider::new(drive, 0.0..=8.0).text("Drive"));
+            ui.add(egui::Slider::new(mix, 0.0..=1.0).text("Mix"));
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct LevelMeter {
+    left: f32,
+    right: f32,
+}
+
+impl LevelMeter {
+    const SILENCE: Self = Self {
+        left: 0.0,
+        right: 0.0,
+    };
+
+    fn scaled(self, gain: f32) -> Self {
+        Self {
+            left: (self.left * gain).max(0.0),
+            right: (self.right * gain).max(0.0),
+        }
+    }
+
+    fn add(self, other: Self) -> Self {
+        Self {
+            left: (self.left + other.left).min(1.0),
+            right: (self.right + other.right).min(1.0),
+        }
+    }
+}
+
+fn estimate_master_meter(project: &Project, frame: u64) -> LevelMeter {
+    project
+        .tracks
+        .iter()
+        .filter(|track| !track.muted)
+        .map(|track| estimate_track_meter(track, frame))
+        .fold(LevelMeter::SILENCE, LevelMeter::add)
+        .scaled(project.master_gain)
+}
+
+fn estimate_track_meter(track: &Track, frame: u64) -> LevelMeter {
+    if track.muted {
+        return LevelMeter::SILENCE;
+    }
+    let clip_level = track
+        .clips
+        .iter()
+        .map(|clip| estimate_clip_level(clip, frame))
+        .fold(0.0_f32, |sum, level| (sum + level).min(1.0));
+    let level = clip_level * track.gain.max(0.0) * track.automation_gain_at(frame).max(0.0);
+    let pan = track.pan.clamp(-1.0, 1.0);
+    let left = level * if pan > 0.0 { 1.0 - pan * 0.65 } else { 1.0 };
+    let right = level * if pan < 0.0 { 1.0 + pan * 0.65 } else { 1.0 };
+    LevelMeter {
+        left: left.min(1.0),
+        right: right.min(1.0),
+    }
+}
+
+fn estimate_clip_level(clip: &Clip, frame: u64) -> f32 {
+    if frame < clip.start_frame || frame >= clip.end_frame() {
+        return 0.0;
+    }
+    let envelope = clip_envelope_gain(clip, frame);
+    let source_level = match &clip.source {
+        ClipSource::Midi { notes, amplitude } => notes
+            .iter()
+            .filter(|note| {
+                let start = clip.start_frame.saturating_add(note.start_frame);
+                frame >= start && frame < start.saturating_add(note.length_frames)
+            })
+            .map(|note| f32::from(note.velocity) / 127.0 * *amplitude)
+            .fold(0.0_f32, |sum, level| (sum + level).min(1.0)),
+        ClipSource::Sine { amplitude, .. } => *amplitude,
+        ClipSource::AudioFile { .. } => 0.75,
+    };
+    (source_level * clip.gain.max(0.0) * envelope).clamp(0.0, 1.0)
+}
+
+fn clip_envelope_gain(clip: &Clip, frame: u64) -> f32 {
+    let relative = frame.saturating_sub(clip.start_frame);
+    let fade_in = if clip.fade_in_frames == 0 {
+        1.0
+    } else {
+        #[allow(clippy::cast_precision_loss)]
+        {
+            (relative as f32 / clip.fade_in_frames as f32).clamp(0.0, 1.0)
+        }
+    };
+    let remaining = clip.end_frame().saturating_sub(frame);
+    let fade_out = if clip.fade_out_frames == 0 {
+        1.0
+    } else {
+        #[allow(clippy::cast_precision_loss)]
+        {
+            (remaining as f32 / clip.fade_out_frames as f32).clamp(0.0, 1.0)
+        }
+    };
+    fade_in.min(fade_out)
+}
+
+fn normalized_clip_gain(
+    stereo_samples: &[f32],
+    source_offset_frames: u64,
+    clip_length_frames: u64,
+    project_sample_rate: u32,
+    source_sample_rate: u32,
+) -> Option<f32> {
+    if project_sample_rate == 0 || source_sample_rate == 0 || clip_length_frames == 0 {
+        return None;
+    }
+    let source_frames = u64::try_from(stereo_samples.len() / 2).ok()?;
+    let source_length_frames =
+        rescale_frames_round(clip_length_frames, project_sample_rate, source_sample_rate).max(1);
+    let start = source_offset_frames.min(source_frames);
+    let end = start
+        .saturating_add(source_length_frames)
+        .min(source_frames);
+    if end <= start {
+        return None;
+    }
+    let start_sample = usize::try_from(start.saturating_mul(2)).ok()?;
+    let end_sample = usize::try_from(end.saturating_mul(2)).ok()?;
+    let peak = stereo_samples[start_sample..end_sample]
+        .iter()
+        .map(|sample| sample.abs())
+        .fold(0.0_f32, f32::max);
+    if peak <= f32::EPSILON {
+        return None;
+    }
+    Some((0.98 / peak).min(16.0))
+}
+
+fn level_meter(ui: &mut egui::Ui, meter: LevelMeter, width: f32) {
+    let desired = egui::vec2(width, 13.0);
+    let (rect, _response) = ui.allocate_exact_size(desired, egui::Sense::hover());
+    let painter = ui.painter();
+    painter.rect_filled(rect, 2.0, Color32::from_rgb(13, 16, 20));
+    painter.rect_stroke(
+        rect,
+        2.0,
+        egui::Stroke::new(1.0, Color32::from_rgb(49, 55, 66)),
+        egui::StrokeKind::Inside,
+    );
+    let gap = 1.0;
+    let lane_height = (rect.height() - gap) * 0.5;
+    let top = egui::Rect::from_min_size(rect.left_top(), egui::vec2(rect.width(), lane_height));
+    let bottom = egui::Rect::from_min_size(
+        egui::pos2(rect.left(), top.bottom() + gap),
+        egui::vec2(rect.width(), lane_height),
+    );
+    paint_meter_lane(painter, top.shrink(1.0), meter.left);
+    paint_meter_lane(painter, bottom.shrink(1.0), meter.right);
+}
+
+fn paint_meter_lane(painter: &egui::Painter, rect: egui::Rect, value: f32) {
+    let value = value.clamp(0.0, 1.0);
+    let fill = egui::Rect::from_min_max(
+        rect.left_top(),
+        egui::pos2(rect.left() + rect.width() * value, rect.bottom()),
+    );
+    let color = if value > 0.92 {
+        Color32::from_rgb(255, 92, 92)
+    } else if value > 0.72 {
+        Color32::from_rgb(244, 185, 77)
+    } else {
+        Color32::from_rgb(82, 214, 142)
+    };
+    painter.rect_filled(fill, 1.0, color);
+    painter.vline(
+        rect.left() + rect.width() * 0.72,
+        rect.y_range(),
+        egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(240, 240, 240, 80)),
+    );
+    painter.vline(
+        rect.left() + rect.width() * 0.92,
+        rect.y_range(),
+        egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(240, 240, 240, 100)),
+    );
+}
+
 fn track_input_label(input: TrackInput) -> String {
     match input {
         TrackInput::Audio => "Audio input".into(),
@@ -3792,6 +5714,10 @@ fn parse_live_midi(message: LiveMidiMessage) -> Option<ParsedLiveMidi> {
             channel,
             controller: first,
             value: second,
+        }),
+        0xC0 if len >= 2 => Some(ParsedLiveMidi::ProgramChange {
+            channel,
+            program: first.saturating_add(1),
         }),
         0xD0 if len >= 2 => Some(ParsedLiveMidi::ChannelPressure {
             channel,
@@ -3860,6 +5786,17 @@ fn midi_output_events_at(project: &Project, frame: u64) -> Vec<MidiPlaybackEvent
                 value: point.value,
             });
         }
+        if let Some(point) = track
+            .midi_program_changes
+            .iter()
+            .filter(|point| point.frame <= frame)
+            .max_by_key(|point| point.frame)
+        {
+            events.push(MidiPlaybackEvent::ProgramChange {
+                channel,
+                program: point.program,
+            });
+        }
         for clip in &track.clips {
             let ClipSource::Midi { notes, .. } = &clip.source else {
                 continue;
@@ -3880,6 +5817,7 @@ fn midi_output_events_at(project: &Project, frame: u64) -> Vec<MidiPlaybackEvent
     events
 }
 
+#[allow(clippy::too_many_lines)]
 fn midi_output_events_between(
     project: &Project,
     start_frame: u64,
@@ -3937,6 +5875,18 @@ fn midi_output_events_between(
                         channel,
                         note: point.note,
                         value: point.value,
+                    },
+                ));
+            }
+        }
+        for point in &track.midi_program_changes {
+            if point.frame > start_frame && point.frame <= end_frame {
+                timed.push((
+                    point.frame,
+                    1,
+                    MidiPlaybackEvent::ProgramChange {
+                        channel,
+                        program: point.program,
                     },
                 ));
             }
@@ -4019,6 +5969,11 @@ fn midi_playback_event_bytes(event: MidiPlaybackEvent) -> [u8; 3] {
             note.min(127),
             value.min(127),
         ],
+        MidiPlaybackEvent::ProgramChange { channel, program } => [
+            0xC0 | midi_status_channel(channel),
+            program.clamp(1, 128) - 1,
+            0,
+        ],
     }
 }
 
@@ -4044,7 +5999,8 @@ fn record_midi_event(
         | ParsedLiveMidi::Control { channel, .. }
         | ParsedLiveMidi::PitchBend { channel, .. }
         | ParsedLiveMidi::ChannelPressure { channel, .. }
-        | ParsedLiveMidi::PolyPressure { channel, .. } => channel,
+        | ParsedLiveMidi::PolyPressure { channel, .. }
+        | ParsedLiveMidi::ProgramChange { channel, .. } => channel,
     };
     if !take.input.accepts_midi_channel(channel) {
         return;
@@ -4091,11 +6047,107 @@ fn record_midi_event(
             take.poly_pressure
                 .push(MidiPolyPressurePoint { frame, note, value });
         }
+        ParsedLiveMidi::ProgramChange { program, .. } if frame >= record_start_frame => {
+            take.program_changes
+                .push(MidiProgramChangePoint { frame, program });
+        }
         ParsedLiveMidi::Control { .. }
         | ParsedLiveMidi::PitchBend { .. }
         | ParsedLiveMidi::ChannelPressure { .. }
-        | ParsedLiveMidi::PolyPressure { .. } => {}
+        | ParsedLiveMidi::PolyPressure { .. }
+        | ParsedLiveMidi::ProgramChange { .. } => {}
     }
+}
+
+fn prune_retrospective_midi(
+    events: &mut VecDeque<RetrospectiveMidiEvent>,
+    now: Instant,
+    window: Duration,
+) {
+    while events
+        .front()
+        .is_some_and(|event| now.saturating_duration_since(event.received_at) > window)
+    {
+        events.pop_front();
+    }
+}
+
+fn retrospective_midi_clip(
+    events: &VecDeque<RetrospectiveMidiEvent>,
+    now: Instant,
+    window: Duration,
+    sample_rate: u32,
+) -> Option<Clip> {
+    let cutoff = now.checked_sub(window).unwrap_or(now);
+    let mut active_notes = HashMap::<(u8, u8), (u64, u8)>::new();
+    let mut notes = Vec::<MidiNote>::new();
+    let mut first_frame = u64::MAX;
+    let mut last_frame = 0;
+    for event in events.iter().filter(|event| event.received_at >= cutoff) {
+        let frame = duration_to_frames(
+            event.received_at.saturating_duration_since(cutoff),
+            sample_rate,
+        );
+        match event.event {
+            ParsedLiveMidi::NoteOn {
+                channel,
+                note,
+                velocity,
+            } => {
+                active_notes.insert((channel, note), (frame, velocity));
+            }
+            ParsedLiveMidi::NoteOff { channel, note } => {
+                if let Some((start_frame, velocity)) = active_notes.remove(&(channel, note)) {
+                    let end_frame = frame.max(start_frame.saturating_add(1));
+                    first_frame = first_frame.min(start_frame);
+                    last_frame = last_frame.max(end_frame);
+                    notes.push(MidiNote {
+                        start_frame,
+                        length_frames: end_frame - start_frame,
+                        midi_note: note,
+                        velocity,
+                    });
+                }
+            }
+            ParsedLiveMidi::Control { .. }
+            | ParsedLiveMidi::PitchBend { .. }
+            | ParsedLiveMidi::ChannelPressure { .. }
+            | ParsedLiveMidi::PolyPressure { .. }
+            | ParsedLiveMidi::ProgramChange { .. } => {}
+        }
+    }
+    for ((_channel, note), (start_frame, velocity)) in active_notes {
+        let end_frame = duration_to_frames(now.saturating_duration_since(cutoff), sample_rate)
+            .max(start_frame.saturating_add(1));
+        first_frame = first_frame.min(start_frame);
+        last_frame = last_frame.max(end_frame);
+        notes.push(MidiNote {
+            start_frame,
+            length_frames: end_frame - start_frame,
+            midi_note: note,
+            velocity,
+        });
+    }
+    if notes.is_empty() || first_frame == u64::MAX || last_frame <= first_frame {
+        return None;
+    }
+    for note in &mut notes {
+        note.start_frame = note.start_frame.saturating_sub(first_frame);
+    }
+    notes.sort_by_key(|note| (note.start_frame, note.midi_note));
+    Some(Clip {
+        name: "Retrospective MIDI".into(),
+        start_frame: 0,
+        length_frames: last_frame - first_frame,
+        gain: 1.0,
+        fade_in_frames: 0,
+        fade_out_frames: 0,
+        fade_curve: FadeCurve::Linear,
+        source: ClipSource::Midi {
+            notes,
+            amplitude: 0.8,
+        },
+    })
 }
 
 fn push_recorded_note(
@@ -4136,6 +6188,14 @@ fn elapsed_frames(started_at: Instant, sample_rate: u32) -> u64 {
     duration_to_frames(started_at.elapsed(), sample_rate)
 }
 
+fn audio_file_fingerprint(path: &Path) -> std::io::Result<AudioFileFingerprint> {
+    let metadata = fs::metadata(path)?;
+    Ok(AudioFileFingerprint {
+        len: metadata.len(),
+        modified: metadata.modified().ok(),
+    })
+}
+
 fn duration_to_frames(duration: Duration, sample_rate: u32) -> u64 {
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     {
@@ -4163,12 +6223,24 @@ fn demo_project(sample_rate: u32) -> Project {
         name: "First DMO Song".into(),
         sample_rate,
         tempo_bpm: 120.0,
+        time_signature: TimeSignature::default(),
+        cycle_range: None,
+        markers: Vec::new(),
+        arranger_sections: Vec::new(),
         master_gain: 1.0,
         master_inserts: Vec::new(),
         buses: Vec::new(),
         tracks: Vec::new(),
     };
     let beat = u64::from(sample_rate) / 2;
+    project.cycle_range = CycleRange::new(0, beat * 4);
+    project.markers = vec![Marker::new("Intro", 0), Marker::new("Loop", beat * 4)];
+    project.arranger_sections = vec![ArrangerSection {
+        name: "Intro".into(),
+        start_frame: 0,
+        length_frames: beat * 4,
+        color_index: 0,
+    }];
 
     let mut melody = Track::new("Melody");
     melody.gain = 0.35;
@@ -4196,6 +6268,7 @@ fn demo_project(sample_rate: u32) -> Project {
         gain: 1.0,
         fade_in_frames: beat / 8,
         fade_out_frames: beat / 8,
+        fade_curve: FadeCurve::Linear,
         source: ClipSource::Midi {
             notes: [60, 64, 67, 72]
                 .into_iter()
@@ -4224,6 +6297,7 @@ fn demo_project(sample_rate: u32) -> Project {
         gain: 1.0,
         fade_in_frames: beat / 8,
         fade_out_frames: beat / 8,
+        fade_curve: FadeCurve::Linear,
         source: ClipSource::Midi {
             notes: vec![MidiNote {
                 start_frame: 0,
@@ -4267,6 +6341,13 @@ fn grid_note_frames(sample_rate: u32, tempo_bpm: f64, snap_grid: SnapGrid) -> u6
     grid
 }
 
+fn pitch_class_name(root: u8) -> &'static str {
+    const NAMES: [&str; 12] = [
+        "C", "C#/Db", "D", "D#/Eb", "E", "F", "F#/Gb", "G", "G#/Ab", "A", "A#/Bb", "B",
+    ];
+    NAMES[usize::from(root % 12)]
+}
+
 fn format_time(frame: u64, sample_rate: u32) -> String {
     let total_millis = frame.saturating_mul(1_000) / u64::from(sample_rate);
     let minutes = total_millis / 60_000;
@@ -4297,19 +6378,58 @@ fn midi_cc_label(controller: u8) -> String {
     format!("CC{controller} {name}")
 }
 
-fn format_musical_position(frame: u64, sample_rate: u32, tempo_bpm: f64) -> String {
+fn format_musical_position(
+    frame: u64,
+    sample_rate: u32,
+    tempo_bpm: f64,
+    time_signature: TimeSignature,
+) -> String {
     if sample_rate == 0 || !tempo_bpm.is_finite() || tempo_bpm <= 0.0 {
         return "001.01.000".into();
     }
     #[allow(clippy::cast_precision_loss)]
-    let total_beats = frame as f64 * tempo_bpm / (f64::from(sample_rate) * 60.0);
+    let total_quarter_notes = frame as f64 * tempo_bpm / (f64::from(sample_rate) * 60.0);
+    let total_beats = total_quarter_notes * f64::from(time_signature.denominator) / 4.0;
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let bar = (total_beats / 4.0).floor() as u64 + 1;
+    let bar = (total_beats / f64::from(time_signature.numerator.max(1))).floor() as u64 + 1;
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let beat = (total_beats % 4.0).floor() as u64 + 1;
+    let beat = (total_beats % f64::from(time_signature.numerator.max(1))).floor() as u64 + 1;
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let ticks = (total_beats.fract() * 960.0).floor() as u64;
     format!("{bar:03}.{beat:02}.{ticks:03}")
+}
+
+fn frames_to_seconds(frames: u64, sample_rate: u32) -> f64 {
+    if sample_rate == 0 {
+        return 0.0;
+    }
+    #[allow(clippy::cast_precision_loss)]
+    {
+        frames as f64 / f64::from(sample_rate)
+    }
+}
+
+fn marker_insert_index(markers: &[Marker], frame: u64) -> usize {
+    markers.partition_point(|marker| marker.frame <= frame)
+}
+
+fn arranger_insert_index(sections: &[ArrangerSection], frame: u64) -> usize {
+    sections.partition_point(|section| section.start_frame <= frame)
+}
+
+fn arranger_color(index: u8) -> Color32 {
+    ARRANGER_COLORS[usize::from(index) % ARRANGER_COLORS.len()]
+}
+
+fn color_swatch(ui: &mut egui::Ui, color: Color32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(18.0, 12.0), egui::Sense::hover());
+    ui.painter().rect_filled(rect, 2.0, color);
+    ui.painter().rect_stroke(
+        rect,
+        2.0,
+        egui::Stroke::new(1.0, Color32::from_rgb(48, 52, 60)),
+        egui::StrokeKind::Inside,
+    );
 }
 
 fn recording_output_path(
@@ -4329,6 +6449,29 @@ fn recording_output_path(
         .as_millis();
     Ok(directory.join(format!(
         "{}_{}_{}.wav",
+        sanitize_file_component(project_name),
+        sanitize_file_component(track_name),
+        timestamp
+    )))
+}
+
+fn bounce_output_path(
+    project_path: Option<&Path>,
+    project_name: &str,
+    track_name: &str,
+) -> std::io::Result<PathBuf> {
+    let base = project_path
+        .and_then(Path::parent)
+        .filter(|path| !path.as_os_str().is_empty())
+        .map_or_else(std::env::current_dir, |path| Ok(path.to_path_buf()))?;
+    let directory = base.join("Exports").join("Bounces");
+    fs::create_dir_all(&directory)?;
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    Ok(directory.join(format!(
+        "{}_{}_bounce_{}.wav",
         sanitize_file_component(project_name),
         sanitize_file_component(track_name),
         timestamp
@@ -4362,11 +6505,19 @@ fn discard_stereo_prefix(samples: &mut Vec<f32>, frames: usize) {
     samples.drain(..sample_count);
 }
 
-fn bars_to_frames(bars: u8, sample_rate: u32, tempo_bpm: f64) -> u64 {
+fn bars_to_frames(
+    bars: u8,
+    sample_rate: u32,
+    tempo_bpm: f64,
+    time_signature: TimeSignature,
+) -> u64 {
     if bars == 0 || sample_rate == 0 || !tempo_bpm.is_finite() || tempo_bpm <= 0.0 {
         return 0;
     }
-    let frames = f64::from(sample_rate) * 60.0 / tempo_bpm * 4.0 * f64::from(bars);
+    let quarter_notes_per_bar =
+        f64::from(time_signature.numerator) * 4.0 / f64::from(time_signature.denominator);
+    let frames =
+        f64::from(sample_rate) * 60.0 / tempo_bpm * quarter_notes_per_bar * f64::from(bars);
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     {
         frames.round() as u64
@@ -4387,6 +6538,7 @@ fn audio_clip_section(
         source_offset_frames,
         source_sample_rate,
         channels,
+        reversed,
     } = &clip.source
     else {
         return None;
@@ -4407,6 +6559,7 @@ fn audio_clip_section(
         } else {
             0
         },
+        fade_curve: clip.fade_curve,
         source: ClipSource::AudioFile {
             path: path.clone(),
             source_offset_frames: source_offset_frames.saturating_add(rescale_frames_round(
@@ -4416,6 +6569,7 @@ fn audio_clip_section(
             )),
             source_sample_rate: *source_sample_rate,
             channels: *channels,
+            reversed: *reversed,
         },
     })
 }
@@ -4472,6 +6626,69 @@ fn comp_recording_into_track(
         track.clips.insert(insertion, right);
     }
     selected_index
+}
+
+#[derive(Clone, Copy)]
+struct LoopRecordingSource<'a> {
+    base_name: &'a str,
+    path: &'a str,
+    source_sample_rate: u32,
+    project_sample_rate: u32,
+    channels: u16,
+    record_start_frame: u64,
+    recorded_length_frames: u64,
+    loop_start_frame: u64,
+    loop_end_frame: u64,
+}
+
+fn comp_loop_recording_into_track(track: &mut Track, source: LoopRecordingSource<'_>) -> usize {
+    let takes = loop_recording_clips(source);
+    if takes.is_empty() {
+        return track.clips.len();
+    }
+    let active = takes[takes.len() - 1].clone();
+    for take in takes[..takes.len() - 1]
+        .iter()
+        .filter_map(AudioTake::from_clip)
+    {
+        track.take_lanes.push(take);
+    }
+    comp_recording_into_track(track, active, source.project_sample_rate)
+}
+
+fn loop_recording_clips(source: LoopRecordingSource<'_>) -> Vec<Clip> {
+    let loop_length = source
+        .loop_end_frame
+        .saturating_sub(source.loop_start_frame);
+    if loop_length == 0 || source.recorded_length_frames == 0 {
+        return Vec::new();
+    }
+    let mut clips = Vec::new();
+    let mut offset = 0;
+    while offset < source.recorded_length_frames {
+        let length = loop_length.min(source.recorded_length_frames - offset);
+        clips.push(Clip {
+            name: format!("{} Pass {}", source.base_name, clips.len() + 1),
+            start_frame: source.loop_start_frame,
+            length_frames: length,
+            gain: 1.0,
+            fade_in_frames: 0,
+            fade_out_frames: 0,
+            fade_curve: FadeCurve::Linear,
+            source: ClipSource::AudioFile {
+                path: source.path.to_owned(),
+                source_offset_frames: source
+                    .record_start_frame
+                    .saturating_sub(source.loop_start_frame)
+                    .saturating_add(offset),
+                source_sample_rate: source.source_sample_rate,
+                channels: source.channels,
+                reversed: false,
+            },
+        });
+        offset = offset.saturating_add(length);
+    }
+    clips
 }
 
 fn clip_from_take_section(
@@ -4596,9 +6813,75 @@ mod tests {
 
     #[test]
     fn musical_position_uses_four_four_bars_and_960_ticks() {
-        assert_eq!(format_musical_position(0, 48_000, 120.0), "001.01.000");
-        assert_eq!(format_musical_position(24_000, 48_000, 120.0), "001.02.000");
-        assert_eq!(format_musical_position(96_000, 48_000, 120.0), "002.01.000");
+        let four_four = TimeSignature::default();
+        assert_eq!(
+            format_musical_position(0, 48_000, 120.0, four_four),
+            "001.01.000"
+        );
+        assert_eq!(
+            format_musical_position(24_000, 48_000, 120.0, four_four),
+            "001.02.000"
+        );
+        assert_eq!(
+            format_musical_position(96_000, 48_000, 120.0, four_four),
+            "002.01.000"
+        );
+    }
+
+    #[test]
+    fn meters_follow_active_clip_gain_and_mute() {
+        let mut track = Track::new("Metered");
+        track.gain = 0.5;
+        track.clips.push(Clip {
+            name: "Note".into(),
+            start_frame: 100,
+            length_frames: 100,
+            gain: 1.0,
+            fade_in_frames: 0,
+            fade_out_frames: 0,
+            fade_curve: FadeCurve::Linear,
+            source: ClipSource::Midi {
+                notes: vec![MidiNote {
+                    start_frame: 0,
+                    length_frames: 100,
+                    midi_note: 60,
+                    velocity: 127,
+                }],
+                amplitude: 1.0,
+            },
+        });
+
+        let meter = estimate_track_meter(&track, 120);
+        assert!((meter.left - 0.5).abs() < 0.001);
+        assert!((meter.right - 0.5).abs() < 0.001);
+        assert_eq!(estimate_track_meter(&track, 250), LevelMeter::SILENCE);
+
+        track.muted = true;
+        assert_eq!(estimate_track_meter(&track, 120), LevelMeter::SILENCE);
+    }
+
+    #[test]
+    fn normalize_gain_uses_selected_audio_range_peak() {
+        let samples = vec![0.1, -0.1, 0.2, -0.2, 0.5, -0.25, 0.05, -0.05];
+        let gain = normalized_clip_gain(&samples, 1, 2, 48_000, 48_000).unwrap();
+        assert!((gain - 1.96).abs() < 0.001);
+        assert!(normalized_clip_gain(&[0.0, 0.0, 0.0, 0.0], 0, 2, 48_000, 48_000).is_none());
+    }
+
+    #[test]
+    fn slip_edit_converts_project_frames_to_source_frames() {
+        assert_eq!(
+            slipped_source_offset(1_000, 48_000, 48_000, 44_100, Some(80_000)),
+            45_100
+        );
+        assert_eq!(
+            slipped_source_offset(1_000, -48_000, 48_000, 44_100, Some(80_000)),
+            0
+        );
+        assert_eq!(
+            slipped_source_offset(79_000, 48_000, 48_000, 44_100, Some(80_000)),
+            79_999
+        );
     }
 
     #[test]
@@ -4614,17 +6897,77 @@ mod tests {
     }
 
     #[test]
+    fn audio_file_fingerprint_detects_size_changes() {
+        let path = std::env::temp_dir().join(format!(
+            "dmo-fingerprint-{}-{}.wav",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        fs::write(&path, b"one").unwrap();
+        let first = audio_file_fingerprint(&path).unwrap();
+        fs::write(&path, b"one-two").unwrap();
+        let second = audio_file_fingerprint(&path).unwrap();
+        let _ = fs::remove_file(path);
+
+        assert_ne!(first.len, second.len);
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn channel_strip_presets_create_useful_insert_chains() {
+        let vocal = ChannelStripPreset::CleanVocal.inserts();
+        assert!(matches!(
+            vocal[0].effect,
+            InsertEffect::ThreeBandEq { high_db, .. } if high_db > 0.0
+        ));
+        assert!(matches!(
+            vocal[1].effect,
+            InsertEffect::Compressor { ratio, .. } if ratio >= 3.0
+        ));
+
+        let master = ChannelStripPreset::MasterGlue.inserts();
+        assert_eq!(master.len(), 2);
+        assert!(matches!(
+            master[0].effect,
+            InsertEffect::Compressor { ratio, .. } if ratio <= 2.0
+        ));
+        assert!(
+            ChannelStripPreset::ALL
+                .into_iter()
+                .all(|preset| !preset.inserts().is_empty())
+        );
+    }
+
+    #[test]
     fn recording_names_are_safe_and_punch_ranges_truncate_stereo_frames() {
         assert_eq!(sanitize_file_component("Lead / Vox: 1"), "Lead___Vox__1");
         assert_eq!(sanitize_file_component("///"), "take");
+        let base = std::env::temp_dir().join(format!("dmo-bounce-test-{}", std::process::id()));
+        let project_path = base.join("song.dmo");
+        let bounce = bounce_output_path(Some(&project_path), "Song / 1", "Lead:Vox").unwrap();
+        assert_eq!(
+            bounce.parent().unwrap(),
+            base.join("Exports").join("Bounces")
+        );
+        assert!(
+            bounce
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("Song___1_Lead_Vox_bounce_")
+        );
         let mut samples = vec![0.0; 12];
         truncate_stereo_recording(&mut samples, 4);
         assert_eq!(samples.len(), 8);
         discard_stereo_prefix(&mut samples, 2);
         assert_eq!(samples.len(), 4);
-        assert_eq!(bars_to_frames(1, 48_000, 120.0), 96_000);
-        assert_eq!(bars_to_frames(4, 48_000, 120.0), 384_000);
-        assert_eq!(bars_to_frames(0, 48_000, 120.0), 0);
+        let four_four = TimeSignature::default();
+        assert_eq!(bars_to_frames(1, 48_000, 120.0, four_four), 96_000);
+        assert_eq!(bars_to_frames(4, 48_000, 120.0, four_four), 384_000);
+        assert_eq!(bars_to_frames(0, 48_000, 120.0, four_four), 0);
     }
 
     #[test]
@@ -4637,11 +6980,13 @@ mod tests {
             gain: 1.0,
             fade_in_frames: 10,
             fade_out_frames: 10,
+            fade_curve: FadeCurve::Linear,
             source: ClipSource::AudioFile {
                 path: "old.wav".into(),
                 source_offset_frames: 5,
                 source_sample_rate: 48_000,
                 channels: 2,
+                reversed: false,
             },
         });
         let new_take = Clip {
@@ -4651,11 +6996,13 @@ mod tests {
             gain: 1.0,
             fade_in_frames: 0,
             fade_out_frames: 0,
+            fade_curve: FadeCurve::Linear,
             source: ClipSource::AudioFile {
                 path: "new.wav".into(),
                 source_offset_frames: 0,
                 source_sample_rate: 48_000,
                 channels: 2,
+                reversed: false,
             },
         };
 
@@ -4690,6 +7037,35 @@ mod tests {
     }
 
     #[test]
+    fn loop_recording_splits_passes_into_active_clip_and_take_lanes() {
+        let mut track = Track::new("Guitar");
+        let selected = comp_loop_recording_into_track(
+            &mut track,
+            LoopRecordingSource {
+                base_name: "Guitar Take",
+                path: "loop.wav",
+                source_sample_rate: 48_000,
+                project_sample_rate: 48_000,
+                channels: 2,
+                record_start_frame: 100,
+                recorded_length_frames: 250,
+                loop_start_frame: 100,
+                loop_end_frame: 200,
+            },
+        );
+
+        assert_eq!(selected, 0);
+        assert_eq!(track.clips.len(), 1);
+        assert_eq!(track.take_lanes.len(), 2);
+        assert_eq!(track.clips[0].name, "Guitar Take Pass 3");
+        assert_eq!(track.clips[0].start_frame, 100);
+        assert_eq!(track.clips[0].length_frames, 50);
+        assert_eq!(track.take_lanes[0].name, "Guitar Take Pass 1");
+        assert_eq!(track.take_lanes[0].source_offset_frames, 0);
+        assert_eq!(track.take_lanes[1].source_offset_frames, 100);
+    }
+
+    #[test]
     fn first_available_clip_is_selected() {
         let mut project = Project::new("Selection", 48_000, 120.0).unwrap();
         project.tracks.push(Track::new("Empty"));
@@ -4701,6 +7077,7 @@ mod tests {
             gain: 1.0,
             fade_in_frames: 0,
             fade_out_frames: 0,
+            fade_curve: FadeCurve::Linear,
             source: ClipSource::Sine {
                 frequency_hz: 261.63,
                 amplitude: 0.5,
@@ -4753,6 +7130,7 @@ mod tests {
             gain: 0.75,
             fade_in_frames: 10,
             fade_out_frames: 20,
+            fade_curve: FadeCurve::Linear,
             source: ClipSource::Midi {
                 notes: vec![MidiNote {
                     start_frame: 20,
@@ -4802,11 +7180,13 @@ mod tests {
             gain: 1.0,
             fade_in_frames: 0,
             fade_out_frames: 0,
+            fade_curve: FadeCurve::Linear,
             source: ClipSource::AudioFile {
                 path: "take.wav".into(),
                 source_offset_frames: 100,
                 source_sample_rate: 44_100,
                 channels: 2,
+                reversed: false,
             },
         };
 
@@ -4832,11 +7212,13 @@ mod tests {
             gain: 1.0,
             fade_in_frames: 0,
             fade_out_frames: 0,
+            fade_curve: FadeCurve::Linear,
             source: ClipSource::AudioFile {
                 path: "take.wav".into(),
                 source_offset_frames: 100,
                 source_sample_rate: 44_100,
                 channels: 2,
+                reversed: false,
             },
         });
         project.tracks.push(track);
@@ -4885,6 +7267,7 @@ mod tests {
         let note = LiveMidiMessage::from_bytes_at(&[0x91, 64, 100], now).unwrap();
         let bend = LiveMidiMessage::from_bytes_at(&[0xE1, 0, 96], now).unwrap();
         let pressure = LiveMidiMessage::from_bytes_at(&[0xD1, 77], now).unwrap();
+        let program = LiveMidiMessage::from_bytes_at(&[0xC1, 41], now).unwrap();
 
         assert_eq!(
             parse_live_midi(note),
@@ -4908,6 +7291,13 @@ mod tests {
                 value: 77,
             })
         );
+        assert_eq!(
+            parse_live_midi(program),
+            Some(ParsedLiveMidi::ProgramChange {
+                channel: 2,
+                program: 42,
+            })
+        );
     }
 
     #[test]
@@ -4921,6 +7311,7 @@ mod tests {
             pitch_bend: Vec::new(),
             channel_pressure: Vec::new(),
             poly_pressure: Vec::new(),
+            program_changes: Vec::new(),
         };
         record_midi_event(
             &mut take,
@@ -4951,6 +7342,15 @@ mod tests {
             140,
             100,
         );
+        record_midi_event(
+            &mut take,
+            ParsedLiveMidi::ProgramChange {
+                channel: 2,
+                program: 42,
+            },
+            160,
+            100,
+        );
         finish_active_midi_notes(&mut take, 220, 100);
 
         assert_eq!(take.notes.len(), 1);
@@ -4958,6 +7358,40 @@ mod tests {
         assert_eq!(take.notes[0].start_frame, 120);
         assert_eq!(take.notes[0].length_frames, 100);
         assert_eq!(take.pitch_bend[0].value, -2048);
+        assert_eq!(take.program_changes[0].program, 42);
+    }
+
+    #[test]
+    fn retrospective_midi_clip_captures_recent_complete_notes() {
+        let now = Instant::now();
+        let mut events = VecDeque::new();
+        events.push_back(RetrospectiveMidiEvent {
+            received_at: now.checked_sub(Duration::from_millis(400)).unwrap(),
+            event: ParsedLiveMidi::NoteOn {
+                channel: 1,
+                note: 64,
+                velocity: 100,
+            },
+        });
+        events.push_back(RetrospectiveMidiEvent {
+            received_at: now.checked_sub(Duration::from_millis(100)).unwrap(),
+            event: ParsedLiveMidi::NoteOff {
+                channel: 1,
+                note: 64,
+            },
+        });
+
+        let clip = retrospective_midi_clip(&events, now, Duration::from_secs(1), 1_000).unwrap();
+
+        assert_eq!(clip.length_frames, 300);
+        assert!(matches!(
+            clip.source,
+            ClipSource::Midi { notes, .. }
+                if notes.len() == 1
+                    && notes[0].start_frame == 0
+                    && notes[0].length_frames == 300
+                    && notes[0].midi_note == 64
+        ));
     }
 
     #[test]
@@ -4972,6 +7406,7 @@ mod tests {
             gain: 1.0,
             fade_in_frames: 0,
             fade_out_frames: 0,
+            fade_curve: FadeCurve::Linear,
             source: ClipSource::Midi {
                 notes: vec![MidiNote {
                     start_frame: 20,
@@ -4987,6 +7422,10 @@ mod tests {
             controller: 74,
             value: 91,
         });
+        track.midi_program_changes.push(MidiProgramChangePoint {
+            frame: 125,
+            program: 42,
+        });
         project.tracks.push(track);
 
         assert_eq!(
@@ -4996,6 +7435,10 @@ mod tests {
                     channel: 3,
                     note: 64,
                     velocity: 100,
+                },
+                MidiPlaybackEvent::ProgramChange {
+                    channel: 3,
+                    program: 42,
                 },
                 MidiPlaybackEvent::Control {
                     channel: 3,
@@ -5033,6 +7476,13 @@ mod tests {
                 velocity: 127,
             }),
             [0x91, 60, 127]
+        );
+        assert_eq!(
+            midi_playback_event_bytes(MidiPlaybackEvent::ProgramChange {
+                channel: 3,
+                program: 42,
+            }),
+            [0xC2, 41, 0]
         );
     }
 }

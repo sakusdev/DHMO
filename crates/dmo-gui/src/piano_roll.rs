@@ -836,6 +836,7 @@ mod tests {
                 gain: 1.0,
                 fade_in_frames: 0,
                 fade_out_frames: 0,
+                fade_curve: dmo_core::FadeCurve::Linear,
                 source: ClipSource::Sine {
                     frequency_hz: midi_note_frequency(note),
                     amplitude: 0.8,
