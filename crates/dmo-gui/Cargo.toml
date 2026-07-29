@@ -9,11 +9,20 @@ rust-version.workspace = true
 name = "dmo-gui"
 path = "src/main.rs"
 
+[lib]
+name = "dmo_gui"
+path = "src/lib.rs"
+
 [dependencies]
 dmo-audio = { path = "../dmo-audio" }
 dmo-core = { path = "../dmo-core" }
-eframe = { version = "0.35.0", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
 midir = "0.11.0"
+
+[target.'cfg(target_os = "android")'.dependencies]
+eframe = { version = "0.35.0", default-features = false, features = ["default_fonts", "glow", "android-native-activity"] }
+
+[target.'cfg(not(target_os = "android"))'.dependencies]
+eframe = { version = "0.35.0", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
 rfd = "0.17.2"
 
 [features]

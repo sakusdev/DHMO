@@ -1,8 +1,8 @@
 # DMO
 
 DMO is an experimental, open-source digital audio workstation written in Rust.
-The project starts with a small, testable audio core and will grow into a
-cross-platform desktop DAW.
+The project starts with a small, testable audio core and is growing into a
+cross-platform desktop and Android DAW.
 
 ## What works today
 
@@ -35,6 +35,8 @@ cross-platform desktop DAW.
 - Versioned, human-readable `.dmo` project save/load (v21), with v1–v20 compatibility
 - A desktop GUI with timeline, mixer routing, bus/send/insert controls, clip inspector,
   zoom, and playhead
+- An Android 10+ arm64 application with touch-sized controls, app-private project
+  storage, audio playback/recording, and Android MIDI support
 - Channel-strip insert presets for vocal, bass, drums, master glue, and lo-fi color
 - Track bounce/render-in-place and freeze-to-audio from the Arrange track list
 - A resizable piano roll with note lanes, bar/beat grid, note selection, and click-to-add entry
@@ -101,6 +103,42 @@ inserts, master inserts, and bus channel controls. Keyboard shortcuts:
 - `1`: Select tool
 - `2`: Draw tool
 
+## Build the Android APK
+
+The Android application targets Android 10 (API 29) or newer and currently
+builds for `arm64-v8a`. Install the Android SDK/NDK, add the Rust target, and use
+the same patched `cargo-apk` revision as the official eframe 0.35 Android
+example:
+
+```sh
+rustup target add aarch64-linux-android
+cargo install \
+  --git https://github.com/parasyte/cargo-apk.git \
+  --rev 282639508eeed7d73f2e1eaeea042da2716436d5 \
+  cargo-apk
+cargo apk build -p dmo-android --lib
+```
+
+This creates a locally signed debug APK. GitHub Actions publishes an optimized,
+installable `DMO-android-arm64.apk` artifact from the **Android APK** workflow.
+On first launch, grant microphone permission to enable recording.
+
+Workflow artifacts use an ephemeral per-run signing key, so uninstall an older
+workflow APK before installing a newly generated one. Configure a stable
+release key through `cargo-apk` signing settings for distributable upgrades.
+
+Android stores DMO data below the application's external data directory when
+available, falling back to internal app storage:
+
+- `Projects`: `.dmo` project files
+- `Imports`: WAV, MIDI, and SF2 files offered to the in-app import actions
+- `Exports`: mixdowns, stems, MIDI exports, and consolidated projects
+- `Recordings`: captured audio
+
+Because `rfd` does not provide Android dialogs, mobile Open/Import selects the
+most recently modified matching file in these folders, while Save/Export writes
+to the matching folder. The desktop dialogs are unchanged.
+
 ## Command line
 
 ```sh
@@ -124,7 +162,8 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 - `dmo-core`: project/timeline types and deterministic offline audio rendering
 - `dmo-audio`: lock-free callback adapter for native audio devices via CPAL
-- `dmo-gui`: the eframe/egui desktop application
+- `dmo-gui`: the shared eframe/egui desktop and Android application
+- `dmo-android`: Android NativeActivity entry point and APK metadata
 - `dmo-app`: headless project and rendering CLI
 
 The audio core does not depend on a GUI or operating-system audio API. This
@@ -147,8 +186,9 @@ real-time engine without coupling it to the interface.
 ## Platform notes
 
 DMO uses the platform's native audio backend through CPAL: WASAPI on Windows,
-CoreAudio on macOS, and ALSA by default on Linux. Building on Linux requires
-the ALSA development package (for example, `libasound2-dev` on Debian/Ubuntu).
+CoreAudio on macOS, ALSA by default on Linux, and AAudio on Android. Building
+on Linux requires the ALSA development package (for example,
+`libasound2-dev` on Debian/Ubuntu).
 
 ## Contributing
 

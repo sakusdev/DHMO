@@ -1,5 +1,11 @@
 [workspace]
-members = ["crates/dmo-core", "crates/dmo-audio", "crates/dmo-app", "crates/dmo-gui"]
+members = [
+    "crates/dmo-core",
+    "crates/dmo-audio",
+    "crates/dmo-app",
+    "crates/dmo-gui",
+    "crates/dmo-android",
+]
 resolver = "2"
 
 [workspace.package]

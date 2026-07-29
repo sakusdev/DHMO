@@ -1,4 +1,4 @@
-//! Main DMO desktop application.
+//! Main DMO application.
 
 use std::{
     borrow::Cow,
@@ -34,6 +34,7 @@ use crate::{
     piano_roll::{
         DeleteNoteRequest, MoveNoteRequest, PianoRollView, ResizeNoteRequest, WriteCcRequest,
     },
+    platform_dialog,
     timeline::{RULER_HEIGHT, TRACK_HEIGHT, TimelineView, track_color},
 };
 
@@ -83,6 +84,7 @@ pub struct DmoApp {
     soundfont_presets: HashMap<String, Vec<SoundFontPreset>>,
     piano_roll: PianoRollState,
     arrange: ArrangeState,
+    inspector: InspectorState,
     view: AppView,
     dirty: bool,
     status: StatusMessage,
@@ -96,6 +98,18 @@ struct ActiveRecording {
     capture_start_frame: u64,
     record_start_frame: u64,
     end_frame: Option<u64>,
+}
+
+struct InspectorState {
+    open: bool,
+}
+
+impl Default for InspectorState {
+    fn default() -> Self {
+        Self {
+            open: !cfg!(target_os = "android"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -446,7 +460,6 @@ impl DmoApp {
             .map(|(track_index, _)| track_index)
             .or_else(|| (!project.tracks.is_empty()).then_some(0));
         let selected_note = first_note_selection(&project, selected_clip);
-        let midi_ports = MidiInputManager::ports().unwrap_or_default();
         let midi_output_ports = MidiOutputManager::ports().unwrap_or_default();
         let mut app = Self {
             project,
@@ -465,7 +478,7 @@ impl DmoApp {
             selected_audio_input_device: None,
             midi_tools: MidiToolsState::default(),
             midi_input: MidiInputManager::new(),
-            midi_ports,
+            midi_ports: MidiInputManager::ports().unwrap_or_default(),
             selected_midi_port: None,
             midi_output: MidiOutputManager::new(),
             midi_output_ports,
@@ -490,6 +503,7 @@ impl DmoApp {
                 snap_enabled: true,
                 snap_grid: SnapGrid::Sixteenth,
             },
+            inspector: InspectorState::default(),
             view,
             dirty: false,
             status,
@@ -668,6 +682,7 @@ impl DmoApp {
                 {
                     self.piano_roll.scroll_to_selection = true;
                 }
+                ui.checkbox(&mut self.inspector.open, "Inspector");
             });
             ui.menu_button("Audio", |ui| {
                 let selected_name = self
@@ -4184,7 +4199,7 @@ impl DmoApp {
     }
 
     fn import_wav_dialog(&mut self) {
-        let Some(path) = rfd::FileDialog::new()
+        let Some(path) = platform_dialog::FileDialog::new()
             .add_filter("WAV audio", &["wav", "wave"])
             .set_title("Import WAV audio")
             .pick_file()
@@ -4259,7 +4274,7 @@ impl DmoApp {
     }
 
     fn import_soundfont_for_track(&mut self, track_index: usize) {
-        let Some(path) = rfd::FileDialog::new()
+        let Some(path) = platform_dialog::FileDialog::new()
             .add_filter("SoundFont", &["sf2"])
             .set_title("Load SoundFont instrument")
             .pick_file()
@@ -4314,7 +4329,7 @@ impl DmoApp {
             self.status_error("Relink is only available for imported audio clips");
             return;
         }
-        let Some(path) = rfd::FileDialog::new()
+        let Some(path) = platform_dialog::FileDialog::new()
             .add_filter("WAV audio", &["wav", "wave"])
             .set_title("Relink WAV audio")
             .pick_file()
@@ -4416,7 +4431,7 @@ impl DmoApp {
 
     #[allow(clippy::too_many_lines)]
     fn import_midi_dialog(&mut self) {
-        let Some(path) = rfd::FileDialog::new()
+        let Some(path) = platform_dialog::FileDialog::new()
             .add_filter("Standard MIDI File", &["mid", "midi"])
             .set_title("Import MIDI")
             .pick_file()
@@ -4536,7 +4551,7 @@ impl DmoApp {
             .and_then(Path::file_stem)
             .and_then(|name| name.to_str())
             .map_or_else(|| "untitled.mid".into(), |name| format!("{name}.mid"));
-        let Some(path) = rfd::FileDialog::new()
+        let Some(path) = platform_dialog::FileDialog::new()
             .add_filter("Standard MIDI File", &["mid", "midi"])
             .set_file_name(suggested)
             .set_title("Export MIDI")
@@ -4685,7 +4700,7 @@ impl DmoApp {
         if !self.confirm_discard_changes() {
             return;
         }
-        let Some(path) = rfd::FileDialog::new()
+        let Some(path) = platform_dialog::FileDialog::new()
             .add_filter("DMO project", &["dmo"])
             .set_title("Open DMO project")
             .pick_file()
@@ -4717,7 +4732,7 @@ impl DmoApp {
             .and_then(Path::file_name)
             .and_then(|name| name.to_str())
             .unwrap_or("untitled.dmo");
-        let Some(path) = rfd::FileDialog::new()
+        let Some(path) = platform_dialog::FileDialog::new()
             .add_filter("DMO project", &["dmo"])
             .set_file_name(suggested)
             .set_title("Save DMO project")
@@ -4746,7 +4761,7 @@ impl DmoApp {
             .and_then(Path::file_stem)
             .and_then(|name| name.to_str())
             .map_or_else(|| "dmo-export.wav".into(), |name| format!("{name}.wav"));
-        let Some(path) = rfd::FileDialog::new()
+        let Some(path) = platform_dialog::FileDialog::new()
             .add_filter("WAV audio", &["wav"])
             .set_file_name(suggested)
             .set_title(format!("Export stereo {}", format.label()))
@@ -4780,7 +4795,7 @@ impl DmoApp {
     }
 
     fn export_stems_dialog(&mut self) {
-        let Some(output_dir) = rfd::FileDialog::new()
+        let Some(output_dir) = platform_dialog::FileDialog::new()
             .set_title("Export track stems")
             .pick_folder()
         else {
@@ -4824,7 +4839,7 @@ impl DmoApp {
     }
 
     fn consolidate_project_dialog(&mut self) {
-        let Some(output_dir) = rfd::FileDialog::new()
+        let Some(output_dir) = platform_dialog::FileDialog::new()
             .set_title("Consolidate project")
             .pick_folder()
         else {
@@ -5056,13 +5071,13 @@ impl DmoApp {
         if !self.dirty {
             return true;
         }
-        rfd::MessageDialog::new()
-            .set_level(rfd::MessageLevel::Warning)
+        platform_dialog::MessageDialog::new()
+            .set_level(platform_dialog::MessageLevel::Warning)
             .set_title("Unsaved DMO project")
             .set_description("Discard the unsaved changes in the current project?")
-            .set_buttons(rfd::MessageButtons::YesNo)
+            .set_buttons(platform_dialog::MessageButtons::YesNo)
             .show()
-            == rfd::MessageDialogResult::Yes
+            == platform_dialog::MessageDialogResult::Yes
     }
 
     fn status_ok(&mut self, message: impl Into<String>) {
@@ -5310,6 +5325,10 @@ impl eframe::App for DmoApp {
         self.update_recording(ui);
         self.keyboard_shortcuts(ui);
 
+        #[cfg(target_os = "android")]
+        egui::Panel::top("android_status_bar_space").show(ui, |ui| {
+            ui.set_height(24.0);
+        });
         egui::Panel::top("menu_bar").show(ui, |ui| self.menu_bar(ui));
         egui::Panel::top("arrange_toolbar")
             .frame(
@@ -5331,8 +5350,16 @@ impl eframe::App for DmoApp {
             )
             .show(ui, |ui| self.transport_bar(ui));
         egui::Panel::left("track_panel")
-            .default_size(230.0)
-            .size_range(190.0..=320.0)
+            .default_size(if cfg!(target_os = "android") {
+                172.0
+            } else {
+                230.0
+            })
+            .size_range(if cfg!(target_os = "android") {
+                150.0..=240.0
+            } else {
+                190.0..=320.0
+            })
             .resizable(true)
             .frame(
                 egui::Frame::new()
@@ -5340,15 +5367,29 @@ impl eframe::App for DmoApp {
                     .inner_margin(0.0),
             )
             .show(ui, |ui| self.track_panel(ui));
-        egui::Panel::right("inspector")
-            .default_size(240.0)
-            .size_range(200.0..=340.0)
-            .resizable(true)
-            .show(ui, |ui| self.inspector(ui));
+        if self.inspector.open {
+            egui::Panel::right("inspector")
+                .default_size(if cfg!(target_os = "android") {
+                    210.0
+                } else {
+                    240.0
+                })
+                .size_range(180.0..=340.0)
+                .resizable(true)
+                .show(ui, |ui| self.inspector(ui));
+        }
         if self.piano_roll.open {
             egui::Panel::bottom("piano_roll")
-                .default_size(280.0)
-                .size_range(180.0..=520.0)
+                .default_size(if cfg!(target_os = "android") {
+                    180.0
+                } else {
+                    280.0
+                })
+                .size_range(if cfg!(target_os = "android") {
+                    130.0..=360.0
+                } else {
+                    180.0..=520.0
+                })
                 .resizable(true)
                 .frame(
                     egui::Frame::new()
@@ -6359,6 +6400,11 @@ fn configure_theme(context: &egui::Context) {
     context.all_styles_mut(|style| {
         style.spacing.item_spacing = egui::vec2(8.0, 6.0);
         style.spacing.button_padding = egui::vec2(10.0, 5.0);
+        if cfg!(target_os = "android") {
+            style.spacing.interact_size.y = 30.0;
+            style.spacing.button_padding = egui::vec2(11.0, 7.0);
+            style.spacing.slider_width = 120.0;
+        }
     });
 }
 
