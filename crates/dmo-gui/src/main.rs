@@ -1,10 +1,4 @@
-mod app;
-mod midi_input;
-mod midi_output;
-mod piano_roll;
-mod timeline;
-
-use app::DmoApp;
+use dmo_gui::DmoApp;
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
