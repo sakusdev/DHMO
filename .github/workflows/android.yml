@@ -53,6 +53,23 @@ jobs:
           --rev 282639508eeed7d73f2e1eaeea042da2716436d5
           cargo-apk
 
+      - name: Create ephemeral release signing key
+        run: |
+          keytool -genkeypair \
+            -keystore "${RUNNER_TEMP}/dmo-release.keystore" \
+            -storepass android \
+            -keypass android \
+            -alias dmo-ci \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000 \
+            -dname "CN=DMO CI, O=sakusdev, C=JP" \
+            -noprompt
+          {
+            echo "CARGO_APK_RELEASE_KEYSTORE=${RUNNER_TEMP}/dmo-release.keystore"
+            echo "CARGO_APK_RELEASE_KEYSTORE_PASSWORD=android"
+          } >> "${GITHUB_ENV}"
+
       - name: Build release APK
         run: cargo apk build --release -p dmo-android --lib
 

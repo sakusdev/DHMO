@@ -116,12 +116,16 @@ cargo install \
   --git https://github.com/parasyte/cargo-apk.git \
   --rev 282639508eeed7d73f2e1eaeea042da2716436d5 \
   cargo-apk
-cargo apk build --release -p dmo-android --lib
+cargo apk build -p dmo-android --lib
 ```
 
-GitHub Actions publishes an installable `DMO-android-arm64.apk` artifact from
-the **Android APK** workflow. On first launch, grant microphone permission to
-enable recording.
+This creates a locally signed debug APK. GitHub Actions publishes an optimized,
+installable `DMO-android-arm64.apk` artifact from the **Android APK** workflow.
+On first launch, grant microphone permission to enable recording.
+
+Workflow artifacts use an ephemeral per-run signing key, so uninstall an older
+workflow APK before installing a newly generated one. Configure a stable
+release key through `cargo-apk` signing settings for distributable upgrades.
 
 Android stores DMO data below the application's external data directory when
 available, falling back to internal app storage:

@@ -84,7 +84,7 @@ pub struct DmoApp {
     soundfont_presets: HashMap<String, Vec<SoundFontPreset>>,
     piano_roll: PianoRollState,
     arrange: ArrangeState,
-    inspector_open: bool,
+    inspector: InspectorState,
     view: AppView,
     dirty: bool,
     status: StatusMessage,
@@ -98,6 +98,18 @@ struct ActiveRecording {
     capture_start_frame: u64,
     record_start_frame: u64,
     end_frame: Option<u64>,
+}
+
+struct InspectorState {
+    open: bool,
+}
+
+impl Default for InspectorState {
+    fn default() -> Self {
+        Self {
+            open: !cfg!(target_os = "android"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -448,7 +460,6 @@ impl DmoApp {
             .map(|(track_index, _)| track_index)
             .or_else(|| (!project.tracks.is_empty()).then_some(0));
         let selected_note = first_note_selection(&project, selected_clip);
-        let midi_ports = MidiInputManager::ports().unwrap_or_default();
         let midi_output_ports = MidiOutputManager::ports().unwrap_or_default();
         let mut app = Self {
             project,
@@ -467,7 +478,7 @@ impl DmoApp {
             selected_audio_input_device: None,
             midi_tools: MidiToolsState::default(),
             midi_input: MidiInputManager::new(),
-            midi_ports,
+            midi_ports: MidiInputManager::ports().unwrap_or_default(),
             selected_midi_port: None,
             midi_output: MidiOutputManager::new(),
             midi_output_ports,
@@ -492,7 +503,7 @@ impl DmoApp {
                 snap_enabled: true,
                 snap_grid: SnapGrid::Sixteenth,
             },
-            inspector_open: !cfg!(target_os = "android"),
+            inspector: InspectorState::default(),
             view,
             dirty: false,
             status,
@@ -671,7 +682,7 @@ impl DmoApp {
                 {
                     self.piano_roll.scroll_to_selection = true;
                 }
-                ui.checkbox(&mut self.inspector_open, "Inspector");
+                ui.checkbox(&mut self.inspector.open, "Inspector");
             });
             ui.menu_button("Audio", |ui| {
                 let selected_name = self
@@ -5356,7 +5367,7 @@ impl eframe::App for DmoApp {
                     .inner_margin(0.0),
             )
             .show(ui, |ui| self.track_panel(ui));
-        if self.inspector_open {
+        if self.inspector.open {
             egui::Panel::right("inspector")
                 .default_size(if cfg!(target_os = "android") {
                     210.0
