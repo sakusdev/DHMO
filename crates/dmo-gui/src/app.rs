@@ -1,13 +1,17 @@
 //! Main DMO desktop application.
 
 use std::{
+    borrow::Cow,
     collections::{HashMap, HashSet, VecDeque},
     fs,
     path::{Path, PathBuf},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use dmo_audio::{Playback, Recording as AudioRecording, default_output_device_info};
+use dmo_audio::{
+    AudioInputDevice, Playback, Recording as AudioRecording, available_input_devices,
+    default_output_device_info,
+};
 use dmo_core::{
     ArrangerSection, AudioTake, AutomationPoint, Bus, ChannelInsert, ChannelOutput, Clip,
     ClipSource, CycleRange, EditCommand, EditHistory, FadeCurve, GrooveQuantizeOptions,
@@ -57,6 +61,8 @@ pub struct DmoApp {
     playback: Option<Playback>,
     recording: Option<ActiveRecording>,
     recording_options: RecordingOptions,
+    audio_input_devices: Vec<AudioInputDevice>,
+    selected_audio_input_device: Option<String>,
     midi_tools: MidiToolsState,
     midi_input: MidiInputManager,
     midi_ports: Vec<String>,
@@ -84,12 +90,18 @@ pub struct DmoApp {
 
 struct ActiveRecording {
     capture: Option<AudioRecording>,
-    audio_track_indices: Vec<usize>,
+    audio_takes: Vec<ActiveAudioTake>,
     midi_takes: Vec<ActiveMidiTake>,
     started_at: Instant,
     capture_start_frame: u64,
     record_start_frame: u64,
     end_frame: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ActiveAudioTake {
+    track_index: usize,
+    input: TrackInput,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -434,6 +446,7 @@ impl DmoApp {
             .map(|(track_index, _)| track_index)
             .or_else(|| (!project.tracks.is_empty()).then_some(0));
         let selected_note = first_note_selection(&project, selected_clip);
+        let audio_input_devices = available_input_devices().unwrap_or_default();
         let midi_ports = MidiInputManager::ports().unwrap_or_default();
         let midi_output_ports = MidiOutputManager::ports().unwrap_or_default();
         let mut app = Self {
@@ -449,6 +462,8 @@ impl DmoApp {
             playback: None,
             recording: None,
             recording_options: RecordingOptions::default(),
+            audio_input_devices,
+            selected_audio_input_device: None,
             midi_tools: MidiToolsState::default(),
             midi_input: MidiInputManager::new(),
             midi_ports,
@@ -557,6 +572,8 @@ impl DmoApp {
     #[allow(clippy::too_many_lines)]
     fn menu_bar(&mut self, ui: &mut egui::Ui) {
         let mut action = None;
+        let mut audio_input_choice = None;
+        let mut refresh_audio_inputs = false;
         let mut midi_choice = None;
         let mut midi_output_choice = None;
         let mut refresh_midi = false;
@@ -653,6 +670,51 @@ impl DmoApp {
                     self.piano_roll.scroll_to_selection = true;
                 }
             });
+            ui.menu_button("Audio", |ui| {
+                let selected_name = self
+                    .selected_audio_input_device
+                    .as_deref()
+                    .and_then(|selected| {
+                        self.audio_input_devices
+                            .iter()
+                            .find(|device| device.id == selected)
+                    })
+                    .map_or("System default", |device| device.name.as_str());
+                ui.label(RichText::new("Recording input").color(Color32::from_rgb(151, 157, 169)));
+                ui.label(selected_name);
+                ui.separator();
+                if ui
+                    .selectable_label(self.selected_audio_input_device.is_none(), "System default")
+                    .clicked()
+                {
+                    audio_input_choice = Some(None);
+                    ui.close();
+                }
+                for device in &self.audio_input_devices {
+                    let label = if device.is_default {
+                        format!("{} (default)", device.name)
+                    } else {
+                        device.name.clone()
+                    };
+                    if ui
+                        .selectable_label(
+                            self.selected_audio_input_device.as_deref() == Some(device.id.as_str()),
+                            label,
+                        )
+                        .clicked()
+                    {
+                        audio_input_choice = Some(Some(device.id.clone()));
+                        ui.close();
+                    }
+                }
+                if self.audio_input_devices.is_empty() {
+                    ui.label("No audio input devices found");
+                }
+                ui.separator();
+                if ui.button("Refresh devices").clicked() {
+                    refresh_audio_inputs = true;
+                }
+            });
             ui.menu_button("MIDI", |ui| {
                 ui.label(RichText::new("Input").color(Color32::from_rgb(151, 157, 169)));
                 ui.label(
@@ -726,6 +788,36 @@ impl DmoApp {
 
         if let Some(action) = action {
             self.perform_action(action);
+        }
+        if refresh_audio_inputs {
+            match available_input_devices() {
+                Ok(devices) => {
+                    if self.selected_audio_input_device.as_ref().is_some_and(|selected| {
+                        !devices.iter().any(|device| &device.id == selected)
+                    }) {
+                        self.selected_audio_input_device = None;
+                    }
+                    self.audio_input_devices = devices;
+                    self.status_ok(format!(
+                        "Found {} audio input(s)",
+                        self.audio_input_devices.len()
+                    ));
+                }
+                Err(error) => self.status_error(error.to_string()),
+            }
+        }
+        if let Some(choice) = audio_input_choice {
+            self.selected_audio_input_device = choice;
+            let name = self
+                .selected_audio_input_device
+                .as_deref()
+                .and_then(|selected| {
+                    self.audio_input_devices
+                        .iter()
+                        .find(|device| device.id == selected)
+                })
+                .map_or_else(|| "System default".to_owned(), |device| device.name.clone());
+            self.status_ok(format!("Audio recording input: {name}"));
         }
         if refresh_midi {
             let mut errors = Vec::new();
@@ -1385,7 +1477,21 @@ impl DmoApp {
                 egui::ComboBox::from_id_salt(("record_input", track_index))
                     .selected_text(track_input_label(edited.input))
                     .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut edited.input, TrackInput::Audio, "Audio input");
+                        ui.selectable_value(
+                            &mut edited.input,
+                            TrackInput::Audio,
+                            "Audio Stereo (1–2)",
+                        );
+                        ui.selectable_value(
+                            &mut edited.input,
+                            TrackInput::AudioMonoLeft,
+                            "Audio Mono (Input 1)",
+                        );
+                        ui.selectable_value(
+                            &mut edited.input,
+                            TrackInput::AudioMonoRight,
+                            "Audio Mono (Input 2)",
+                        );
                         ui.selectable_value(&mut edited.input, TrackInput::MidiOmni, "MIDI Omni");
                         ui.separator();
                         for channel in 1..=16 {
@@ -3222,10 +3328,13 @@ impl DmoApp {
             self.status_error("Arm at least one track with R before recording");
             return;
         }
-        let audio_track_indices = armed_tracks
+        let audio_takes = armed_tracks
             .iter()
             .copied()
-            .filter(|index| self.project.tracks[*index].input == TrackInput::Audio)
+            .filter_map(|track_index| {
+                let input = self.project.tracks[track_index].input;
+                input.is_audio().then_some(ActiveAudioTake { track_index, input })
+            })
             .collect::<Vec<_>>();
         let midi_takes = armed_tracks
             .iter()
@@ -3261,9 +3370,9 @@ impl DmoApp {
             self.status_error("Use Punch or Cycle Takes, not both at once");
             return;
         }
-        let monitoring = audio_track_indices
+        let monitoring = audio_takes
             .iter()
-            .any(|index| self.project.tracks[*index].recording.input_monitoring);
+            .any(|take| self.project.tracks[take.track_index].recording.input_monitoring);
         let record_start_frame = if self.recording_options.punch_enabled
             || self.recording_options.cycle_take_recording
         {
@@ -3295,10 +3404,14 @@ impl DmoApp {
             } else {
                 None
             };
-        let capture = if audio_track_indices.is_empty() {
+        let capture = if audio_takes.is_empty() {
             None
         } else {
-            match AudioRecording::start(self.project.sample_rate, monitoring) {
+            match AudioRecording::start_on_device(
+                self.project.sample_rate,
+                monitoring,
+                self.selected_audio_input_device.as_deref(),
+            ) {
                 Ok(capture) => Some(capture),
                 Err(error) => {
                     self.status_error(error);
@@ -3322,7 +3435,7 @@ impl DmoApp {
         self.playhead_frame = capture_start_frame;
         self.recording = Some(ActiveRecording {
             capture,
-            audio_track_indices,
+            audio_takes,
             midi_takes,
             started_at: Instant::now(),
             capture_start_frame,
@@ -3385,82 +3498,104 @@ impl DmoApp {
             truncate_stereo_recording(&mut captured.samples, maximum_frames);
             let frame_count = captured.samples.len() / 2;
             if frame_count > 0 {
-                let first_track_name = recording
-                    .audio_track_indices
-                    .first()
-                    .and_then(|index| self.project.tracks.get(*index))
-                    .map_or("Track", |track| track.name.as_str());
-                let path = match recording_output_path(
-                    self.project_path.as_deref(),
-                    &self.project.name,
-                    first_track_name,
-                ) {
-                    Ok(path) => path,
-                    Err(error) => {
-                        self.status_error(error);
-                        return;
-                    }
-                };
-                if let Err(error) =
-                    write_stereo_i16_wav(&path, captured.device_info.sample_rate, &captured.samples)
-                {
-                    self.status_error(error);
-                    return;
-                }
-                let overview = match decode_wav_overview(&path, WAVEFORM_PEAKS) {
-                    Ok(overview) => overview,
-                    Err(error) => {
-                        self.status_error(error);
-                        return;
-                    }
-                };
-                let stored_path = path.to_string_lossy().into_owned();
-                self.cache_waveform(&stored_path, &path, overview);
-                let clip_name = path.file_stem().map_or_else(
-                    || "Recorded Take".into(),
-                    |name| name.to_string_lossy().into_owned(),
-                );
                 let length_frames = u64::try_from(frame_count).unwrap_or(u64::MAX);
-                for track_index in recording.audio_track_indices {
-                    let mut track = self.project.tracks[track_index].clone();
-                    let clip_index = if self.recording_options.cycle_take_recording {
-                        comp_loop_recording_into_track(
-                            &mut track,
-                            LoopRecordingSource {
-                                base_name: &clip_name,
-                                path: &stored_path,
-                                source_sample_rate: captured.device_info.sample_rate,
-                                project_sample_rate: self.project.sample_rate,
-                                channels: 2,
-                                record_start_frame: recording.record_start_frame,
-                                recorded_length_frames: length_frames,
-                                loop_start_frame: self.loop_start_frame,
-                                loop_end_frame: self.loop_end_frame,
-                            },
-                        )
-                    } else {
-                        let clip = Clip {
-                            name: clip_name.clone(),
-                            start_frame: recording.record_start_frame,
-                            length_frames,
-                            gain: 1.0,
-                            fade_in_frames: 0,
-                            fade_out_frames: 0,
-                            fade_curve: FadeCurve::Linear,
-                            source: ClipSource::AudioFile {
-                                path: stored_path.clone(),
-                                source_offset_frames: 0,
-                                source_sample_rate: captured.device_info.sample_rate,
-                                channels: 2,
-                                reversed: false,
-                            },
-                        };
-                        comp_recording_into_track(&mut track, clip, self.project.sample_rate)
+                let mut wrote_audio = false;
+                for input in [
+                    TrackInput::Audio,
+                    TrackInput::AudioMonoLeft,
+                    TrackInput::AudioMonoRight,
+                ] {
+                    let track_indices = recording
+                        .audio_takes
+                        .iter()
+                        .filter(|take| take.input == input)
+                        .map(|take| take.track_index)
+                        .collect::<Vec<_>>();
+                    let Some(first_track_index) = track_indices.first().copied() else {
+                        continue;
                     };
-                    self.apply_edit(EditCommand::ReplaceTrack { track_index, track });
-                    first_selection.get_or_insert((track_index, clip_index));
+                    let route_name = format!(
+                        "{}_{}",
+                        self.project.tracks[first_track_index].name,
+                        audio_input_file_suffix(input)
+                    );
+                    let path = match recording_output_path(
+                        self.project_path.as_deref(),
+                        &self.project.name,
+                        &route_name,
+                    ) {
+                        Ok(path) => path,
+                        Err(error) => {
+                            self.status_error(error);
+                            return;
+                        }
+                    };
+                    let routed_samples = routed_stereo_input(&captured.samples, input);
+                    if let Err(error) = write_stereo_i16_wav(
+                        &path,
+                        captured.device_info.sample_rate,
+                        routed_samples.as_ref(),
+                    ) {
+                        self.status_error(error);
+                        return;
+                    }
+                    let overview = match decode_wav_overview(&path, WAVEFORM_PEAKS) {
+                        Ok(overview) => overview,
+                        Err(error) => {
+                            self.status_error(error);
+                            return;
+                        }
+                    };
+                    let stored_path = path.to_string_lossy().into_owned();
+                    self.cache_waveform(&stored_path, &path, overview);
+                    let clip_name = path.file_stem().map_or_else(
+                        || "Recorded Take".into(),
+                        |name| name.to_string_lossy().into_owned(),
+                    );
+                    for track_index in track_indices {
+                        let mut track = self.project.tracks[track_index].clone();
+                        let clip_index = if self.recording_options.cycle_take_recording {
+                            comp_loop_recording_into_track(
+                                &mut track,
+                                LoopRecordingSource {
+                                    base_name: &clip_name,
+                                    path: &stored_path,
+                                    source_sample_rate: captured.device_info.sample_rate,
+                                    project_sample_rate: self.project.sample_rate,
+                                    channels: 2,
+                                    record_start_frame: recording.record_start_frame,
+                                    recorded_length_frames: length_frames,
+                                    loop_start_frame: self.loop_start_frame,
+                                    loop_end_frame: self.loop_end_frame,
+                                },
+                            )
+                        } else {
+                            let clip = Clip {
+                                name: clip_name.clone(),
+                                start_frame: recording.record_start_frame,
+                                length_frames,
+                                gain: 1.0,
+                                fade_in_frames: 0,
+                                fade_out_frames: 0,
+                                fade_curve: FadeCurve::Linear,
+                                source: ClipSource::AudioFile {
+                                    path: stored_path.clone(),
+                                    source_offset_frames: 0,
+                                    source_sample_rate: captured.device_info.sample_rate,
+                                    channels: 2,
+                                    reversed: false,
+                                },
+                            };
+                            comp_recording_into_track(&mut track, clip, self.project.sample_rate)
+                        };
+                        self.apply_edit(EditCommand::ReplaceTrack { track_index, track });
+                        first_selection.get_or_insert((track_index, clip_index));
+                    }
+                    wrote_audio = true;
                 }
-                recorded_sources.push("audio");
+                if wrote_audio {
+                    recorded_sources.push("audio");
+                }
             }
         }
 
@@ -5675,7 +5810,9 @@ fn paint_meter_lane(painter: &egui::Painter, rect: egui::Rect, value: f32) {
 
 fn track_input_label(input: TrackInput) -> String {
     match input {
-        TrackInput::Audio => "Audio input".into(),
+        TrackInput::Audio => "Audio Stereo 1–2".into(),
+        TrackInput::AudioMonoLeft => "Audio Mono 1".into(),
+        TrackInput::AudioMonoRight => "Audio Mono 2".into(),
         TrackInput::MidiOmni => "MIDI Omni".into(),
         TrackInput::MidiChannel(channel) => format!("MIDI Ch {channel}"),
     }
@@ -6505,6 +6642,30 @@ fn discard_stereo_prefix(samples: &mut Vec<f32>, frames: usize) {
     samples.drain(..sample_count);
 }
 
+fn routed_stereo_input(samples: &[f32], input: TrackInput) -> Cow<'_, [f32]> {
+    match input {
+        TrackInput::Audio => Cow::Borrowed(samples),
+        TrackInput::AudioMonoLeft | TrackInput::AudioMonoRight => {
+            let channel = usize::from(input == TrackInput::AudioMonoRight);
+            let mut routed = Vec::with_capacity(samples.len());
+            for frame in samples.chunks_exact(2) {
+                routed.extend([frame[channel], frame[channel]]);
+            }
+            Cow::Owned(routed)
+        }
+        TrackInput::MidiOmni | TrackInput::MidiChannel(_) => Cow::Borrowed(&[]),
+    }
+}
+
+const fn audio_input_file_suffix(input: TrackInput) -> &'static str {
+    match input {
+        TrackInput::Audio => "stereo_1-2",
+        TrackInput::AudioMonoLeft => "mono_1",
+        TrackInput::AudioMonoRight => "mono_2",
+        TrackInput::MidiOmni | TrackInput::MidiChannel(_) => "midi",
+    }
+}
+
 fn bars_to_frames(
     bars: u8,
     sample_rate: u32,
@@ -6968,6 +7129,23 @@ mod tests {
         assert_eq!(bars_to_frames(1, 48_000, 120.0, four_four), 96_000);
         assert_eq!(bars_to_frames(4, 48_000, 120.0, four_four), 384_000);
         assert_eq!(bars_to_frames(0, 48_000, 120.0, four_four), 0);
+    }
+
+    #[test]
+    fn audio_input_routes_stereo_and_mono_channels() {
+        let samples = [0.1, 0.2, 0.3, 0.4];
+        assert_eq!(
+            routed_stereo_input(&samples, TrackInput::Audio).as_ref(),
+            samples
+        );
+        assert_eq!(
+            routed_stereo_input(&samples, TrackInput::AudioMonoLeft).as_ref(),
+            [0.1, 0.1, 0.3, 0.3]
+        );
+        assert_eq!(
+            routed_stereo_input(&samples, TrackInput::AudioMonoRight).as_ref(),
+            [0.2, 0.2, 0.4, 0.4]
+        );
     }
 
     #[test]

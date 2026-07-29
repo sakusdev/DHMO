@@ -28,6 +28,14 @@ pub struct AudioDeviceInfo {
     pub sample_format: String,
 }
 
+/// A stable, selectable system audio-input endpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AudioInputDevice {
+    pub id: String,
+    pub name: String,
+    pub is_default: bool,
+}
+
 /// Captured stereo input samples and the device configuration that produced them.
 pub struct RecordedInput {
     pub samples: Vec<f32>,
@@ -52,10 +60,36 @@ impl Recording {
     /// Returns [`AudioError`] if a matching input/output configuration cannot
     /// be opened or started.
     pub fn start(sample_rate: u32, monitoring: bool) -> Result<Self, AudioError> {
+        Self::start_on_device(sample_rate, monitoring, None)
+    }
+
+    /// Starts recording from a selected input-device ID, or from the current
+    /// system default when `device_id` is `None`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AudioError`] if the selected endpoint is unavailable or a
+    /// matching input/output configuration cannot be opened or started.
+    pub fn start_on_device(
+        sample_rate: u32,
+        monitoring: bool,
+        device_id: Option<&str>,
+    ) -> Result<Self, AudioError> {
         let host = cpal::default_host();
-        let input_device = host
-            .default_input_device()
-            .ok_or(AudioError::NoInputDevice)?;
+        let input_device = match device_id {
+            Some(device_id) => host
+                .input_devices()
+                .map_err(AudioError::Backend)?
+                .find(|device| {
+                    device
+                        .id()
+                        .is_ok_and(|candidate| candidate.to_string() == device_id)
+                })
+                .ok_or_else(|| AudioError::InputDeviceUnavailable(device_id.to_owned()))?,
+            None => host
+                .default_input_device()
+                .ok_or(AudioError::NoInputDevice)?,
+        };
         let supported = choose_input_config(&input_device, sample_rate)?;
         let device_info = AudioDeviceInfo {
             name: input_device.to_string(),
@@ -134,6 +168,40 @@ impl Recording {
             device_info: self.device_info,
         }
     }
+}
+
+/// Enumerates currently available input endpoints with stable CPAL IDs.
+///
+/// # Errors
+///
+/// Returns [`AudioError`] when the platform audio host cannot enumerate or
+/// identify its input endpoints.
+pub fn available_input_devices() -> Result<Vec<AudioInputDevice>, AudioError> {
+    let host = cpal::default_host();
+    let default_id = host
+        .default_input_device()
+        .and_then(|device| device.id().ok())
+        .map(|id| id.to_string());
+    let mut devices = host
+        .input_devices()
+        .map_err(AudioError::Backend)?
+        .map(|device| {
+            let id = device.id().map_err(AudioError::Backend)?.to_string();
+            Ok(AudioInputDevice {
+                is_default: default_id.as_deref() == Some(id.as_str()),
+                id,
+                name: device.to_string(),
+            })
+        })
+        .collect::<Result<Vec<_>, AudioError>>()?;
+    devices.sort_by(|left, right| {
+        right
+            .is_default
+            .cmp(&left.is_default)
+            .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    Ok(devices)
 }
 
 const MAX_MONITOR_SAMPLES: usize = 16_384;
@@ -692,6 +760,7 @@ where
 pub enum AudioError {
     NoOutputDevice,
     NoInputDevice,
+    InputDeviceUnavailable(String),
     OddStereoSampleCount(usize),
     UnsupportedSampleRate(u32),
     UnsupportedInputSampleRate(u32),
@@ -713,6 +782,9 @@ impl fmt::Display for AudioError {
         match self {
             Self::NoOutputDevice => formatter.write_str("no default audio output device"),
             Self::NoInputDevice => formatter.write_str("no default audio input device"),
+            Self::InputDeviceUnavailable(id) => {
+                write!(formatter, "the selected audio input is unavailable: {id}")
+            }
             Self::OddStereoSampleCount(count) => {
                 write!(formatter, "stereo sample count must be even, got {count}")
             }
