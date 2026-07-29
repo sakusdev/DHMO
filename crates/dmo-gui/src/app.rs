@@ -446,7 +446,6 @@ impl DmoApp {
             .map(|(track_index, _)| track_index)
             .or_else(|| (!project.tracks.is_empty()).then_some(0));
         let selected_note = first_note_selection(&project, selected_clip);
-        let audio_input_devices = available_input_devices().unwrap_or_default();
         let midi_ports = MidiInputManager::ports().unwrap_or_default();
         let midi_output_ports = MidiOutputManager::ports().unwrap_or_default();
         let mut app = Self {
@@ -462,7 +461,7 @@ impl DmoApp {
             playback: None,
             recording: None,
             recording_options: RecordingOptions::default(),
-            audio_input_devices,
+            audio_input_devices: available_input_devices().unwrap_or_default(),
             selected_audio_input_device: None,
             midi_tools: MidiToolsState::default(),
             midi_input: MidiInputManager::new(),
