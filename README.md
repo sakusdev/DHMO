@@ -13,9 +13,11 @@ cross-platform desktop DAW.
 - Track mute/solo, renaming, duplication, and independent mixer controls
 - Track and master level meters in the mixer panel
 - A master output channel and linearly interpolated track-volume automation
-- Default-input audio recording with track arm, software monitoring, punch ranges,
+- Audio recording with track arm, software monitoring, punch ranges,
   configurable pre-roll, loop-record take cycling, non-destructive take lanes,
   and section comping
+- Selectable system audio-input devices with per-track Stereo 1–2, Mono Input 1,
+  and Mono Input 2 recording routes
 - WAV import for integer PCM and 32-bit float audio, including mono/stereo conversion
 - Automatic linear resampling when a WAV and project use different sample rates
 - Stereo waveform overviews drawn directly inside imported timeline clips, with file-change
@@ -30,7 +32,7 @@ cross-platform desktop DAW.
 - Real-time playback through the default system audio device
 - Offline stereo mixdown export as 16-bit PCM, 24-bit PCM, or 32-bit float WAV, plus per-track stem export
 - Project consolidation that copies referenced WAV media into a portable project folder
-- Versioned, human-readable `.dmo` project save/load (v20), with v1–v19 compatibility
+- Versioned, human-readable `.dmo` project save/load (v21), with v1–v20 compatibility
 - A desktop GUI with timeline, mixer routing, bus/send/insert controls, clip inspector,
   zoom, and playhead
 - Channel-strip insert presets for vocal, bass, drums, master glue, and lo-fi color
@@ -131,7 +133,7 @@ real-time engine without coupling it to the interface.
 
 ## Roadmap
 
-1. Input routing and take-lane overview
+1. Expandable take-lane overview and additional multichannel input routing
 2. More built-in effects
 3. Track, plug-in, tempo, and clip automation with editable curves
 4. Low-latency MIDI input monitoring, sample-accurate external MIDI scheduling,

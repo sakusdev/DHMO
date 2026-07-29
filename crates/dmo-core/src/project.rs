@@ -293,9 +293,13 @@ impl SoundFontPreset {
 /// Source accepted by a record-armed track.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TrackInput {
-    /// Capture the default system audio input.
+    /// Capture the first two channels of the selected system audio input.
     #[default]
     Audio,
+    /// Capture the first hardware input channel and place it in both stereo channels.
+    AudioMonoLeft,
+    /// Capture the second hardware input channel and place it in both stereo channels.
+    AudioMonoRight,
     /// Capture channel voice messages from every MIDI channel.
     MidiOmni,
     /// Capture only the conventional 1..=16 MIDI channel.
@@ -306,7 +310,7 @@ impl TrackInput {
     #[must_use]
     pub fn accepts_midi_channel(self, channel: u8) -> bool {
         match self {
-            Self::Audio => false,
+            Self::Audio | Self::AudioMonoLeft | Self::AudioMonoRight => false,
             Self::MidiOmni => (1..=16).contains(&channel),
             Self::MidiChannel(expected) => expected == channel,
         }
@@ -314,7 +318,12 @@ impl TrackInput {
 
     #[must_use]
     pub const fn is_midi(self) -> bool {
-        !matches!(self, Self::Audio)
+        matches!(self, Self::MidiOmni | Self::MidiChannel(_))
+    }
+
+    #[must_use]
+    pub const fn is_audio(self) -> bool {
+        !self.is_midi()
     }
 }
 
@@ -854,6 +863,23 @@ mod tests {
         assert_eq!(midi_controller_value_at(&points, 11, 0, 127), 127);
         assert_eq!(midi_controller_value_at(&points, 11, 25, 127), 64);
         assert_eq!(midi_controller_value_at(&points, 11, 30, 127), 100);
+    }
+
+    #[test]
+    fn audio_and_midi_inputs_are_classified_correctly() {
+        for input in [
+            TrackInput::Audio,
+            TrackInput::AudioMonoLeft,
+            TrackInput::AudioMonoRight,
+        ] {
+            assert!(input.is_audio());
+            assert!(!input.is_midi());
+            assert!(!input.accepts_midi_channel(1));
+        }
+        assert!(TrackInput::MidiOmni.is_midi());
+        assert!(TrackInput::MidiOmni.accepts_midi_channel(16));
+        assert!(TrackInput::MidiChannel(3).accepts_midi_channel(3));
+        assert!(!TrackInput::MidiChannel(3).accepts_midi_channel(4));
     }
 
     #[test]

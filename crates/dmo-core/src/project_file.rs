@@ -13,7 +13,7 @@ use crate::{
 };
 
 /// The project-file format version written by this release.
-pub const PROJECT_FILE_VERSION: u32 = 20;
+pub const PROJECT_FILE_VERSION: u32 = 21;
 
 const LEGACY_PROJECT_FILE_VERSION: u32 = 1;
 const AUDIO_PROJECT_FILE_VERSION: u32 = 2;
@@ -35,6 +35,7 @@ const PROGRAM_CHANGE_PROJECT_FILE_VERSION: u32 = 17;
 const AUDIO_REVERSE_PROJECT_FILE_VERSION: u32 = 18;
 const TIME_SIGNATURE_PROJECT_FILE_VERSION: u32 = 19;
 const SOUNDFONT_PROJECT_FILE_VERSION: u32 = 20;
+const AUDIO_INPUT_ROUTING_PROJECT_FILE_VERSION: u32 = 21;
 
 const FILE_HEADER: &str = "DMO_PROJECT";
 
@@ -177,6 +178,12 @@ pub fn encode_project(project: &Project) -> Result<String, ProjectFileError> {
         );
         match track.input {
             TrackInput::Audio => push_value(&mut output, "record_input", &"audio"),
+            TrackInput::AudioMonoLeft => {
+                push_value(&mut output, "record_input", &"audio_mono_left");
+            }
+            TrackInput::AudioMonoRight => {
+                push_value(&mut output, "record_input", &"audio_mono_right");
+            }
             TrackInput::MidiOmni => push_value(&mut output, "record_input", &"midi_omni"),
             TrackInput::MidiChannel(channel) => {
                 push_value(&mut output, "record_input", &"midi_channel");
@@ -435,6 +442,7 @@ pub fn decode_project(input: &str) -> Result<Project, ProjectFileError> {
             | PROGRAM_CHANGE_PROJECT_FILE_VERSION
             | AUDIO_REVERSE_PROJECT_FILE_VERSION
             | TIME_SIGNATURE_PROJECT_FILE_VERSION
+            | SOUNDFONT_PROJECT_FILE_VERSION
             | PROJECT_FILE_VERSION
     ) {
         return Err(ProjectFileError::UnsupportedVersion(version));
@@ -585,6 +593,12 @@ pub fn decode_project(input: &str) -> Result<Project, ProjectFileError> {
             let (line, input_name) = parser.field("record_input")?;
             match input_name {
                 "audio" => TrackInput::Audio,
+                "audio_mono_left" if version >= AUDIO_INPUT_ROUTING_PROJECT_FILE_VERSION => {
+                    TrackInput::AudioMonoLeft
+                }
+                "audio_mono_right" if version >= AUDIO_INPUT_ROUTING_PROJECT_FILE_VERSION => {
+                    TrackInput::AudioMonoRight
+                }
                 "midi_omni" => TrackInput::MidiOmni,
                 "midi_channel" => {
                     let (channel_line, channel) =
@@ -1811,7 +1825,7 @@ mod tests {
         let project = complete_project();
         let encoded = encode_project(&project).unwrap();
 
-        assert!(encoded.starts_with("DMO_PROJECT 20\n"));
+        assert!(encoded.starts_with("DMO_PROJECT 21\n"));
         assert!(encoded.contains("time_signature_numerator 7\n"));
         assert!(encoded.contains("time_signature_denominator 8\n"));
         assert!(encoded.contains("cycle_enabled true\n"));
@@ -1860,6 +1874,31 @@ mod tests {
         assert!(encoded.contains("output_bus_index 0\n"));
         assert!(encoded.contains("reversed true\n"));
         assert_eq!(decode_project(&encoded).unwrap(), project);
+    }
+
+    #[test]
+    fn mono_audio_input_routes_round_trip() {
+        let mut project = Project::new("Input routing", 48_000, 120.0).unwrap();
+        let mut left = Track::new("Input 1");
+        left.input = TrackInput::AudioMonoLeft;
+        let mut right = Track::new("Input 2");
+        right.input = TrackInput::AudioMonoRight;
+        project.tracks.extend([left, right]);
+
+        let encoded = encode_project(&project).unwrap();
+        assert!(encoded.contains("record_input audio_mono_left\n"));
+        assert!(encoded.contains("record_input audio_mono_right\n"));
+        assert_eq!(decode_project(&encoded).unwrap(), project);
+    }
+
+    #[test]
+    fn version_twenty_projects_remain_compatible() {
+        let project = complete_project();
+        let version_twenty =
+            encode_project(&project)
+                .unwrap()
+                .replacen("DMO_PROJECT 21", "DMO_PROJECT 20", 1);
+        assert_eq!(decode_project(&version_twenty).unwrap(), project);
     }
 
     #[test]
@@ -1936,14 +1975,14 @@ mod tests {
         assert!(
             encode_project(&project)
                 .unwrap()
-                .starts_with("DMO_PROJECT 20\n")
+                .starts_with("DMO_PROJECT 21\n")
         );
     }
 
     fn without_time_signature_fields(encoded: &str, target_version: u32) -> String {
         encoded
             .replacen(
-                "DMO_PROJECT 20",
+                "DMO_PROJECT 21",
                 &format!("DMO_PROJECT {target_version}"),
                 1,
             )
