@@ -792,9 +792,13 @@ impl DmoApp {
         if refresh_audio_inputs {
             match available_input_devices() {
                 Ok(devices) => {
-                    if self.selected_audio_input_device.as_ref().is_some_and(|selected| {
-                        !devices.iter().any(|device| &device.id == selected)
-                    }) {
+                    if self
+                        .selected_audio_input_device
+                        .as_ref()
+                        .is_some_and(|selected| {
+                            !devices.iter().any(|device| &device.id == selected)
+                        })
+                    {
                         self.selected_audio_input_device = None;
                     }
                     self.audio_input_devices = devices;
@@ -3333,7 +3337,9 @@ impl DmoApp {
             .copied()
             .filter_map(|track_index| {
                 let input = self.project.tracks[track_index].input;
-                input.is_audio().then_some(ActiveAudioTake { track_index, input })
+                input
+                    .is_audio()
+                    .then_some(ActiveAudioTake { track_index, input })
             })
             .collect::<Vec<_>>();
         let midi_takes = armed_tracks
@@ -3370,9 +3376,11 @@ impl DmoApp {
             self.status_error("Use Punch or Cycle Takes, not both at once");
             return;
         }
-        let monitoring = audio_takes
-            .iter()
-            .any(|take| self.project.tracks[take.track_index].recording.input_monitoring);
+        let monitoring = audio_takes.iter().any(|take| {
+            self.project.tracks[take.track_index]
+                .recording
+                .input_monitoring
+        });
         let record_start_frame = if self.recording_options.punch_enabled
             || self.recording_options.cycle_take_recording
         {
