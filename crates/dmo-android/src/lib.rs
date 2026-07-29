@@ -66,9 +66,7 @@ fn request_microphone_permission(app: &AndroidApp) {
     }));
 }
 
-fn request_microphone_permission_on_java_thread(
-    app: &AndroidApp,
-) -> Result<(), Box<dyn Error>> {
+fn request_microphone_permission_on_java_thread(app: &AndroidApp) -> Result<(), Box<dyn Error>> {
     // SAFETY: AndroidApp owns both raw references for the lifetime of this
     // callback, and the callback runs on the attached Java main thread.
     let vm = unsafe { JavaVM::from_raw(app.vm_as_ptr().cast())? };
@@ -92,8 +90,7 @@ fn request_microphone_permission_on_java_thread(
     }
 
     let string_class = environment.find_class("java/lang/String")?;
-    let permissions =
-        environment.new_object_array(1, string_class, JObject::null())?;
+    let permissions = environment.new_object_array(1, string_class, JObject::null())?;
     environment.set_object_array_element(&permissions, 0, &permission_object)?;
     let permissions_object = JObject::from(permissions);
     environment.call_method(

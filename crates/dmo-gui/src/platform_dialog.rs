@@ -1,9 +1,7 @@
 //! Platform file and confirmation dialogs.
 
 #[cfg(not(target_os = "android"))]
-pub use rfd::{
-    FileDialog, MessageButtons, MessageDialog, MessageDialogResult, MessageLevel,
-};
+pub use rfd::{FileDialog, MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
 
 #[cfg(target_os = "android")]
 mod android {
@@ -57,10 +55,10 @@ mod android {
         pub fn save_file(self) -> Option<PathBuf> {
             let directory = self.save_directory();
             fs::create_dir_all(&directory).ok()?;
-            let fallback = self
-                .extensions
-                .first()
-                .map_or_else(|| "untitled".to_owned(), |extension| format!("untitled.{extension}"));
+            let fallback = self.extensions.first().map_or_else(
+                || "untitled".to_owned(),
+                |extension| format!("untitled.{extension}"),
+            );
             let requested = self.file_name.as_deref().unwrap_or(&fallback);
             let safe_name = Path::new(requested)
                 .file_name()
@@ -72,7 +70,11 @@ mod android {
 
         #[must_use]
         pub fn pick_folder(self) -> Option<PathBuf> {
-            let title = self.title.as_deref().unwrap_or_default().to_ascii_lowercase();
+            let title = self
+                .title
+                .as_deref()
+                .unwrap_or_default()
+                .to_ascii_lowercase();
             let directory = if title.contains("stem") {
                 PathBuf::from("Exports").join("Stems")
             } else if title.contains("consolidate") {
@@ -85,11 +87,7 @@ mod android {
         }
 
         fn open_directory(&self) -> PathBuf {
-            if self
-                .extensions
-                .iter()
-                .any(|extension| extension == "dmo")
-            {
+            if self.extensions.iter().any(|extension| extension == "dmo") {
                 PathBuf::from("Projects")
             } else {
                 PathBuf::from("Imports")
@@ -97,11 +95,7 @@ mod android {
         }
 
         fn save_directory(&self) -> PathBuf {
-            if self
-                .extensions
-                .iter()
-                .any(|extension| extension == "dmo")
-            {
+            if self.extensions.iter().any(|extension| extension == "dmo") {
                 PathBuf::from("Projects")
             } else {
                 PathBuf::from("Exports")
@@ -185,6 +179,4 @@ mod android {
 }
 
 #[cfg(target_os = "android")]
-pub use android::{
-    FileDialog, MessageButtons, MessageDialog, MessageDialogResult, MessageLevel,
-};
+pub use android::{FileDialog, MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
